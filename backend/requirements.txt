@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+openai-whisper
+google-generativeai
+gTTS
+pydub
+python-dotenv
+static-ffmpeg
