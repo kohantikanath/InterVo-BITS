@@ -1,17 +1,56 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from "react";
-import { Mic, Square, Play, Send, RefreshCw, Bot, User, BrainCircuit } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  AlertCircle,
+  Bot,
+  BrainCircuit,
+  CheckCircle2,
+  Clock3,
+  Mic,
+  Play,
+  RefreshCw,
+  Send,
+  Square,
+  User,
+} from "lucide-react";
 
-// ─── Backend URL ─────────────────────────────────────────────────────────────
-const SERVER_URL = "http://localhost:8000";
+const SERVER_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const TARGET_QUESTIONS = 6;
 
-type Phase = "idle" | "ai_speaking" | "ready" | "recording" | "transcribing" | "pending_submit" | "submitting";
+type Phase =
+  | "idle"
+  | "ai_speaking"
+  | "ready"
+  | "recording"
+  | "transcribing"
+  | "pending_submit"
+  | "submitting";
 
 interface Message {
   role: "ai" | "user";
   text: string;
-  pending?: boolean;
+}
+
+const phaseLabels: Record<Phase, string> = {
+  idle: "Ready",
+  ai_speaking: "InterVo speaking",
+  ready: "Candidate turn",
+  recording: "Recording",
+  transcribing: "Transcribing",
+  pending_submit: "Review answer",
+  submitting: "Evaluating",
+};
+
+const focusAreas = ["Reasoning", "Clarity", "Core concepts", "Follow-up depth"];
+
+function formatTime(seconds: number) {
+  const mins = Math.floor(seconds / 60)
+    .toString()
+    .padStart(2, "0");
+  const secs = (seconds % 60).toString().padStart(2, "0");
+  return `${mins}:${secs}`;
 }
 
 export default function InterviewClient() {
@@ -19,401 +58,389 @@ export default function InterviewClient() {
   const [interviewStarted, setInterviewStarted] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [draftAnswer, setDraftAnswer] = useState("");
+  const [error, setError] = useState("");
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
-  const webMediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const webAudioChunksRef = useRef<Blob[]>([]);
-  const tsBodyRef = useRef<HTMLDivElement>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const scrollToBottom = () => {
-    setTimeout(() => {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-    }, 100);
-  };
+  const userAnswerCount = messages.filter((message) => message.role === "user").length;
+  const aiQuestionCount = messages.filter((message) => message.role === "ai").length;
+  const progress = Math.min(100, Math.round((userAnswerCount / TARGET_QUESTIONS) * 100));
+  const statusLabel = phaseLabels[phase];
+  const isAiSpeaking = phase === "ai_speaking";
+  const isRecording = phase === "recording";
+  const isPendingSubmit = phase === "pending_submit";
+  const isBusy = ["submitting", "transcribing", "ai_speaking"].includes(phase);
 
-  const addMessage = (role: "ai" | "user", text: string, pending = false) => {
-    setMessages((prev) => [...prev, { role, text, pending }]);
-    scrollToBottom();
-  };
+  const currentGuidance = useMemo(() => {
+    if (!interviewStarted) return "Start a structured mock admission interview.";
+    if (phase === "ai_speaking") return "Listen to the full question before answering.";
+    if (phase === "recording") return "Answer aloud with steps, assumptions, and conclusion.";
+    if (phase === "pending_submit") return "Clean the transcript before submitting it.";
+    if (phase === "transcribing") return "Converting your voice into editable text.";
+    if (phase === "submitting") return "Generating feedback and the next question.";
+    return "Record your next answer when ready.";
+  }, [interviewStarted, phase]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, draftAnswer, phase]);
+
+  useEffect(() => {
+    if (!interviewStarted) return;
+    const timer = window.setInterval(() => {
+      setElapsedSeconds((value) => value + 1);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [interviewStarted]);
 
   useEffect(() => {
     return () => {
-      // Cleanup audio on unmount
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.src = "";
-      }
+      audioRef.current?.pause();
+      mediaRecorderRef.current?.stream.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, phase, draftAnswer]);
+  function addMessage(role: "ai" | "user", text: string) {
+    setMessages((previous) => [...previous, { role, text }]);
+  }
 
-  // ── Status label derived from phase ────────────────────────────────────────
-  const statusMap: Record<Phase, string> = {
-    idle: "Ready",
-    ai_speaking: "InterVo Speaking",
-    ready: "Your Turn",
-    recording: "Recording",
-    transcribing: "Transcribing…",
-    pending_submit: "Review Answer",
-    submitting: "Processing…",
-  };
+  function setFailure(message: string) {
+    setError(message);
+    setPhase(interviewStarted ? "ready" : "idle");
+  }
 
-  const getPillClass = () => {
-    if (phase === "ai_speaking") return "speaking";
-    if (phase === "recording") return "recording";
-    if (["transcribing", "submitting"].includes(phase)) return "thinking";
-    return "ready-status";
-  };
-  const statusLabel = statusMap[phase] || "Ready";
-
-  // ── 1. Begin Interview ───────────────────────────────────────────────────────
   async function beginInterview() {
+    setError("");
     setPhase("submitting");
+
     try {
-      const res = await fetch(`${SERVER_URL}/start-interview`, { method: "POST" });
-      if (res.ok) {
-        const data = await res.json();
-        setInterviewStarted(true);
-        await playAiResponse(data.ai_text || null);
-      } else {
-        setPhase("idle");
-        alert("Server error starting interview.");
-      }
-    } catch (e) {
-      console.error(e);
-      setPhase("idle");
+      const response = await fetch(`${SERVER_URL}/start-interview`, { method: "POST" });
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
+
+      const data = await response.json();
+      setInterviewStarted(true);
+      setElapsedSeconds(0);
+      await playAiResponse(data.ai_text || null);
+    } catch (err) {
+      console.error(err);
+      setFailure("Backend is not reachable. Start FastAPI on port 8000 and try again.");
     }
   }
 
-  // ── 2. Play AI audio + show AI transcript immediately when done ──────────────
   async function playAiResponse(aiTextHint: string | null) {
     setPhase("ai_speaking");
+
     try {
       let aiText = aiTextHint;
       if (!aiText) {
-        try {
-          const r = await fetch(`${SERVER_URL}/get-ai-transcript`);
-          if (r.ok) {
-            const d = await r.json();
-            aiText = d.ai_text;
-          }
-        } catch (_) {}
+        const response = await fetch(`${SERVER_URL}/get-ai-transcript`);
+        if (response.ok) {
+          const data = await response.json();
+          aiText = data.ai_text;
+        }
       }
 
-      if (audioRef.current) {
-        audioRef.current.pause();
-      }
-
-      const audio = new Audio(`${SERVER_URL}/get-audio?rnd=${Math.random()}`);
+      audioRef.current?.pause();
+      const audio = new Audio(`${SERVER_URL}/get-audio?rnd=${Date.now()}`);
       audioRef.current = audio;
 
       audio.onended = () => {
-        addMessage("ai", aiText || "AI responded.");
+        addMessage("ai", aiText || "InterVo responded.");
         setPhase("ready");
       };
 
       await audio.play();
     } catch (err) {
       console.error("Playback error:", err);
-      // Fallback
       addMessage("ai", aiTextHint || "InterVo responded.");
       setPhase("ready");
     }
   }
 
-  // ── 3. Start Recording ───────────────────────────────────────────────────────
   async function startRecording() {
-    try {
-      if (audioRef.current) {
-        audioRef.current.pause();
-      }
+    setError("");
 
+    try {
+      audioRef.current?.pause();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
-      const mr = new MediaRecorder(stream, { mimeType });
-      
-      webAudioChunksRef.current = [];
-      mr.ondataavailable = (e) => {
-        if (e.data.size > 0) webAudioChunksRef.current.push(e.data);
+      const recorder = new MediaRecorder(stream, { mimeType });
+
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
       };
-      
-      webMediaRecorderRef.current = mr;
-      mr.start(100);
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(100);
       setPhase("recording");
     } catch (err) {
       console.error(err);
-      alert("Microphone access denied or not available.");
+      setFailure("Microphone permission is required for the voice interview.");
     }
   }
 
-  // ── 4. Stop Recording → Transcribe only ─────────────────────────────────────
   async function stopRecording() {
     if (phase !== "recording") return;
+
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) return;
+
     setPhase("transcribing");
-
-    const mr = webMediaRecorderRef.current;
-    if (!mr) return;
-
-    mr.onstop = async () => {
-      const blob = new Blob(webAudioChunksRef.current, { type: mr.mimeType });
-      mr.stream.getTracks().forEach((t) => t.stop()); // Stop mic tracks
+    recorder.onstop = async () => {
+      const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType });
+      recorder.stream.getTracks().forEach((track) => track.stop());
       await transcribeAudio(blob);
     };
-
-    mr.stop();
+    recorder.stop();
   }
 
-  // ── 5. Transcribe audio → show editable draft ───────────────────────────────
   async function transcribeAudio(blob: Blob) {
     try {
       const formData = new FormData();
       const ext = blob.type.includes("ogg") ? "ogg" : blob.type.includes("mp4") ? "mp4" : "webm";
       formData.append("file", blob, `recording.${ext}`);
 
-      const res = await fetch(`${SERVER_URL}/transcribe-audio`, {
+      const response = await fetch(`${SERVER_URL}/transcribe-audio`, {
         method: "POST",
         body: formData,
       });
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
 
-      if (res.ok) {
-        const data = await res.json();
-        const text = data.user_text || "";
-        setDraftAnswer(text);
-        setPhase("pending_submit");
-        scrollToBottom();
-      } else {
-        console.error("Transcription failed", res.status);
-        setPhase("ready");
-      }
+      const data = await response.json();
+      setDraftAnswer(data.user_text || "");
+      setPhase("pending_submit");
     } catch (err) {
-      console.error("Transcribe error:", err);
-      setPhase("ready");
+      console.error(err);
+      setFailure("Transcription failed. Check the backend logs and record again.");
     }
   }
 
-  // ── 6. Submit (possibly edited) answer ──────────────────────────────────────
   async function submitAnswer() {
     const text = draftAnswer.trim();
-    setPhase("submitting");
+    if (!text) return;
 
-    addMessage("user", text || "(no answer)");
+    setError("");
+    setPhase("submitting");
+    addMessage("user", text);
     setDraftAnswer("");
 
     try {
-      const res = await fetch(`${SERVER_URL}/submit-answer`, {
+      const response = await fetch(`${SERVER_URL}/submit-answer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ user_text: text }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        await playAiResponse(data.ai_text || null);
-      } else {
-        console.error("Submit failed", res.status);
-        setPhase("ready");
-      }
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
+
+      const data = await response.json();
+      await playAiResponse(data.ai_text || null);
     } catch (err) {
-      console.error("Submit error:", err);
-      setPhase("ready");
+      console.error(err);
+      setFailure("Could not submit the answer. Confirm Gemini and gTTS are configured.");
     }
   }
 
-  // ── 7. Re-record — discard draft ────────────────────────────────────────────
   function discardDraft() {
     setDraftAnswer("");
     setPhase("ready");
   }
 
-  const isAiSpeaking = phase === "ai_speaking";
-  const isRecording = phase === "recording";
-  const isBusy = ["submitting", "transcribing", "ai_speaking"].includes(phase);
-  const isPendingSubmit = phase === "pending_submit";
-  const totalMsgs = messages.length + (isPendingSubmit ? 1 : 0);
-
   return (
-    <div className="meet-shell">
-      {/* ── Top bar ── */}
-      <header className="meet-topbar">
-        <div className="topbar-brand">
-          <div className="topbar-logo"><BrainCircuit size={18} color="white" /></div>
+    <div className="interview-shell">
+      <header className="app-header">
+        <div className="brand-block">
+          <div className="brand-mark">
+            <BrainCircuit size={21} />
+          </div>
           <div>
-            <span className="topbar-title">InterVo</span>
-            <span className="topbar-sub">Mathematics Admission</span>
+            <p className="eyebrow">AI mathematics interviewer</p>
+            <h1>InterVo</h1>
           </div>
         </div>
-        
-        <div className={`status-pill ${getPillClass()}`}>
-          <div className="status-dot" />
+
+        <div className={`live-status live-status-${phase}`}>
+          <span />
           {statusLabel}
         </div>
-        
-        <div className="timer-label">
-          {interviewStarted
-            ? phase === "ready"
-              ? "Your turn to answer"
-              : statusLabel
-            : "Not started"}
+
+        <div className="session-time">
+          <Clock3 size={16} />
+          {formatTime(elapsedSeconds)}
         </div>
       </header>
 
-      {/* ── Body ── */}
-      <div className="meet-body">
-        {/* ── Participants (left) ── */}
-        <div className="participants-area">
-          {/* AI tile */}
-          <div className={`participant-tile ai-tile glass-panel ${isAiSpeaking ? "active ai-speaking-glow" : ""}`}>
-            <div className="tile-bg" />
-            <div className="tile-avatar-wrap">
-              <div className="tile-avatar">
-                {isBusy && !isAiSpeaking ? (
-                  <div className="spinner" />
-                ) : (
-                  <Bot size={44} color="#a5b4fc" />
-                )}
-              </div>
-              <div className={`wave-bars ${isAiSpeaking ? "active" : ""}`}>
-                {[1, 2, 3, 4, 5].map((i) => (
-                  <div key={i} className="wave-bar" />
-                ))}
-              </div>
-            </div>
-            <div className="tile-label">
-              <div className="tile-name">InterVo (Interviewer)</div>
-              <div className="tile-mic-indicator">
-                {isAiSpeaking ? <Mic size={14} color="#34d399" /> : <Mic size={14} color="#ef4444" />}
-              </div>
-            </div>
-          </div>
-
-          {/* User tile */}
-          <div className={`participant-tile user-tile glass-panel ${isRecording ? "active" : ""}`}>
-            <div className="tile-bg" />
-            {isRecording && (
-              <div className="pulse-rings">
-                <div className="pulse-ring" />
-                <div className="pulse-ring" />
-                <div className="pulse-ring" />
-              </div>
-            )}
-            <div className="tile-avatar-wrap">
-              <div className="tile-avatar">
-                <User size={44} color="#cbd5e1" />
-              </div>
-            </div>
-            <div className="tile-label">
-              <div className="tile-name">You</div>
-              <div className="tile-mic-indicator">
-                {isRecording ? <Mic size={14} color="#34d399" /> : <Mic size={14} color="#ef4444" />}
-              </div>
-            </div>
-          </div>
+      {error && (
+        <div className="error-banner">
+          <AlertCircle size={17} />
+          {error}
         </div>
+      )}
 
-        {/* ── Transcript sidebar ── */}
-        <aside className="transcript-sidebar glass-panel">
-          <div className="ts-header">
-            <h3>Transcript</h3>
-            {totalMsgs > 0 && <span className="ts-count">{totalMsgs}</span>}
+      <main className="workspace">
+        <section className="stage-panel">
+          <div className="stage-header">
+            <div>
+              <p className="eyebrow">Live assessment room</p>
+              <h2>Admission interview simulation</h2>
+            </div>
+            <div className="question-meter">
+              <span>{userAnswerCount}/{TARGET_QUESTIONS}</span>
+              answers
+            </div>
           </div>
 
-          <div className="ts-body" ref={tsBodyRef}>
-            {messages.length === 0 && !isPendingSubmit ? (
-              <div className="ts-empty">
-                <div className="ts-empty-icon"><RefreshCw size={32} /></div>
-                <div>Transcript appears here as the interview progresses.</div>
-              </div>
-            ) : (
-              <>
-                {messages.map((m, i) => (
-                  <div key={i} className={`msg ${m.role} glass-panel slide-in`}>
-                    <div className="msg-role">
-                      {m.role === "ai" ? "🤖 InterVo" : "🎙 You"}
-                    </div>
-                    <div className="msg-text">{m.text}</div>
-                  </div>
-                ))}
+          <div className="progress-track" aria-label="Interview progress">
+            <div style={{ width: `${progress}%` }} />
+          </div>
 
-                {/* Editable draft — shown after transcription, before submit */}
-                {isPendingSubmit && (
-                  <div className="pending-answer-wrap slide-in">
-                    <div className="pending-answer-label">🎙 Your Answer — Review & Edit</div>
-                    <textarea
-                      className="pending-answer-textarea"
-                      value={draftAnswer}
-                      onChange={(e) => setDraftAnswer(e.target.value)}
-                      placeholder="Your transcribed answer will appear here…"
-                      rows={4}
-                    />
-                    <div className="pending-answer-actions">
-                      <button className="button-secondary cancel-btn" onClick={discardDraft} title="Re-record">
-                        <RefreshCw size={14} /> Re-record
-                      </button>
-                      <button
-                        className="button-success submit-btn"
-                        onClick={submitAnswer}
-                        disabled={!draftAnswer.trim()}
-                      >
-                        <Send size={14} /> Submit Answer
-                      </button>
-                    </div>
+          <div className="participant-grid">
+            <article className={`person-card interviewer ${isAiSpeaking ? "speaking" : ""}`}>
+              <div className="person-background" />
+              <div className="avatar-ring">
+                <Bot size={52} />
+                {isAiSpeaking && (
+                  <div className="voice-bars" aria-hidden="true">
+                    <i />
+                    <i />
+                    <i />
+                    <i />
                   </div>
                 )}
-                <div ref={messagesEndRef} style={{ height: 1, flexShrink: 0 }} />
-              </>
-            )}
-          </div>
-        </aside>
-      </div>
+              </div>
+              <div className="person-footer">
+                <div>
+                  <strong>InterVo</strong>
+                  <span>Adaptive math interviewer</span>
+                </div>
+                <Mic size={16} />
+              </div>
+            </article>
 
-      {/* ── Bottom controls ── */}
-      <div className="meet-controls glass-panel">
-        {!interviewStarted ? (
-          <button
-            className="button-primary begin-btn"
-            onClick={beginInterview}
-            disabled={phase === "submitting"}
-          >
-            {phase === "submitting" ? (
-              <><RefreshCw size={18} className="spinner-icon" /> Connecting…</>
-            ) : (
-              <><Play size={18} /> Begin Interview</>
-            )}
-          </button>
-        ) : isPendingSubmit ? (
-          <span className="ctrl-hint highlight">
-            Review your transcript and click Submit to answer InterVo.
-          </span>
-        ) : (
-          <button
-            className={`button-base ctrl-btn ${isRecording ? "recording-pulse" : "button-secondary"}`}
-            onClick={isRecording ? stopRecording : startRecording}
-            disabled={isBusy || isPendingSubmit}
-            title={isRecording ? "Stop & Transcribe" : "Start Recording"}
-            style={{ borderRadius: '50%', width: '56px', height: '56px' }}
-          >
-            {isRecording ? <Square size={22} color="white" fill="white" /> : <Mic size={22} />}
-          </button>
-        )}
-        {interviewStarted && !isPendingSubmit && (
-          <div className="ctrl-hint">
-            {isAiSpeaking
-              ? "InterVo is speaking…"
-              : phase === "transcribing"
-              ? "Transcribing your audio…"
-              : phase === "submitting"
-              ? "InterVo is thinking…"
-              : isRecording
-              ? "Tap the square to stop & transcribe"
-              : "Tap the microphone to answer"}
+            <article className={`person-card candidate ${isRecording ? "recording" : ""}`}>
+              <div className="person-background candidate-bg" />
+              <div className="avatar-ring candidate-avatar">
+                <User size={52} />
+              </div>
+              <div className="person-footer">
+                <div>
+                  <strong>Candidate</strong>
+                  <span>{isRecording ? "Answering now" : "Waiting turn"}</span>
+                </div>
+                <Mic size={16} />
+              </div>
+            </article>
           </div>
-        )}
-      </div>
+
+          <div className="control-strip">
+            {!interviewStarted ? (
+              <button className="primary-action" onClick={beginInterview} disabled={phase === "submitting"}>
+                {phase === "submitting" ? <RefreshCw className="spin" size={18} /> : <Play size={18} />}
+                {phase === "submitting" ? "Connecting" : "Begin interview"}
+              </button>
+            ) : isPendingSubmit ? (
+              <div className="review-reminder">
+                <CheckCircle2 size={18} />
+                Review the transcript before sending it to InterVo.
+              </div>
+            ) : (
+              <button
+                className={`record-action ${isRecording ? "recording" : ""}`}
+                onClick={isRecording ? stopRecording : startRecording}
+                disabled={isBusy || isPendingSubmit}
+                title={isRecording ? "Stop and transcribe" : "Start recording"}
+              >
+                {isRecording ? <Square size={22} fill="currentColor" /> : <Mic size={24} />}
+              </button>
+            )}
+            <p>{currentGuidance}</p>
+          </div>
+        </section>
+
+        <aside className="insight-panel">
+          <section className="metric-row">
+            <div>
+              <span>{aiQuestionCount}</span>
+              AI prompts
+            </div>
+            <div>
+              <span>{userAnswerCount}</span>
+              Answers
+            </div>
+            <div>
+              <span>{progress}%</span>
+              Progress
+            </div>
+          </section>
+
+          <section className="focus-panel">
+            <div className="panel-heading">
+              <Activity size={16} />
+              Evaluation focus
+            </div>
+            <div className="focus-list">
+              {focusAreas.map((area) => (
+                <span key={area}>{area}</span>
+              ))}
+            </div>
+          </section>
+
+          <section className="transcript-panel">
+            <div className="panel-heading transcript-heading">
+              Transcript
+              <span>{messages.length + (isPendingSubmit ? 1 : 0)}</span>
+            </div>
+
+            <div className="transcript-body">
+              {messages.length === 0 && !isPendingSubmit ? (
+                <div className="empty-state">
+                  <BrainCircuit size={34} />
+                  <p>The interview transcript and editable answer review will appear here.</p>
+                </div>
+              ) : (
+                <>
+                  {messages.map((message, index) => (
+                    <article key={`${message.role}-${index}`} className={`message-card ${message.role}`}>
+                      <p>{message.role === "ai" ? "InterVo" : "Candidate"}</p>
+                      <div>{message.text}</div>
+                    </article>
+                  ))}
+
+                  {isPendingSubmit && (
+                    <article className="draft-card">
+                      <label htmlFor="answer-draft">Review transcribed answer</label>
+                      <textarea
+                        id="answer-draft"
+                        value={draftAnswer}
+                        onChange={(event) => setDraftAnswer(event.target.value)}
+                        placeholder="Your answer transcript will appear here."
+                        rows={5}
+                      />
+                      <div className="draft-actions">
+                        <button className="secondary-action" onClick={discardDraft}>
+                          <RefreshCw size={15} />
+                          Re-record
+                        </button>
+                        <button className="submit-action" onClick={submitAnswer} disabled={!draftAnswer.trim()}>
+                          <Send size={15} />
+                          Submit
+                        </button>
+                      </div>
+                    </article>
+                  )}
+                  <div ref={messagesEndRef} />
+                </>
+              )}
+            </div>
+          </section>
+        </aside>
+      </main>
     </div>
   );
 }
