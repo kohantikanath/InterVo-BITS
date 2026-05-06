@@ -53,6 +53,16 @@ function formatTime(seconds: number) {
   return `${mins}:${secs}`;
 }
 
+function getServerUrl() {
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
+  if (typeof window === "undefined") return SERVER_URL;
+
+  const { hostname } = window.location;
+  if (hostname === "localhost" || hostname === "127.0.0.1") return SERVER_URL;
+
+  return `http://${hostname}:8000`;
+}
+
 export default function InterviewClient() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [interviewStarted, setInterviewStarted] = useState(false);
@@ -118,7 +128,7 @@ export default function InterviewClient() {
     setPhase("submitting");
 
     try {
-      const response = await fetch(`${SERVER_URL}/start-interview`, { method: "POST" });
+      const response = await fetch(`${getServerUrl()}/start-interview`, { method: "POST" });
       if (!response.ok) throw new Error(`Server returned ${response.status}`);
 
       const data = await response.json();
@@ -137,7 +147,7 @@ export default function InterviewClient() {
     try {
       let aiText = aiTextHint;
       if (!aiText) {
-        const response = await fetch(`${SERVER_URL}/get-ai-transcript`);
+        const response = await fetch(`${getServerUrl()}/get-ai-transcript`);
         if (response.ok) {
           const data = await response.json();
           aiText = data.ai_text;
@@ -145,7 +155,7 @@ export default function InterviewClient() {
       }
 
       audioRef.current?.pause();
-      const audio = new Audio(`${SERVER_URL}/get-audio?rnd=${Date.now()}`);
+      const audio = new Audio(`${getServerUrl()}/get-audio?rnd=${Date.now()}`);
       audioRef.current = audio;
 
       audio.onended = () => {
@@ -165,6 +175,16 @@ export default function InterviewClient() {
     setError("");
 
     try {
+      if (!window.isSecureContext) {
+        throw new Error(
+          "Microphone access only works on localhost or HTTPS. Open the app with http://localhost:3000 on this computer, or use HTTPS for LAN testing."
+        );
+      }
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("This browser does not expose microphone recording on the current page.");
+      }
+
       audioRef.current?.pause();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -182,7 +202,7 @@ export default function InterviewClient() {
       setPhase("recording");
     } catch (err) {
       console.error(err);
-      setFailure("Microphone permission is required for the voice interview.");
+      setFailure(err instanceof Error ? err.message : "Microphone permission is required for the voice interview.");
     }
   }
 
@@ -207,7 +227,7 @@ export default function InterviewClient() {
       const ext = blob.type.includes("ogg") ? "ogg" : blob.type.includes("mp4") ? "mp4" : "webm";
       formData.append("file", blob, `recording.${ext}`);
 
-      const response = await fetch(`${SERVER_URL}/transcribe-audio`, {
+      const response = await fetch(`${getServerUrl()}/transcribe-audio`, {
         method: "POST",
         body: formData,
       });
@@ -232,7 +252,7 @@ export default function InterviewClient() {
     setDraftAnswer("");
 
     try {
-      const response = await fetch(`${SERVER_URL}/submit-answer`, {
+      const response = await fetch(`${getServerUrl()}/submit-answer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ user_text: text }),

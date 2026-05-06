@@ -2,7 +2,7 @@ fastapi
 uvicorn
 python-multipart
 openai-whisper
-google-generativeai
+litellm==1.81.1
 gTTS
 pydub
 python-dotenv
