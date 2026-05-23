@@ -21,6 +21,7 @@ from interview_domain import (
     SessionStatus,
     utc_now,
 )
+from interview_policy import build_system_prompt, evaluate_candidate_message, get_interview_policy
 from litellm import completion
 from pydantic import BaseModel
 from pydub import AudioSegment
@@ -29,12 +30,6 @@ load_dotenv()
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini/gemini-2.5-flash")
 DEFAULT_SESSION_TIME_CAP_SECONDS = 300
-INTERVIEWER_SYSTEM_PROMPT = (
-    "You are InterVo, a professional mathematics interviewer conducting an "
-    "admission interview for SST. Your goal is to help candidates clarify "
-    "their math concepts."
-)
-
 # Set ffmpeg paths required by pydub.
 AudioSegment.converter = shutil.which("ffmpeg")
 AudioSegment.ffmpeg = shutil.which("ffmpeg")
@@ -167,19 +162,44 @@ def build_next_question_prompt(session: InterviewSession) -> str:
     )
 
 
-def generate_interview_question(prompt: str, fallback: str) -> str:
+def build_legacy_answer_prompt(user_text: str) -> str:
+    return (
+        f"The candidate answered: {user_text}. "
+        "Respond as a strict DSA interviewer: briefly acknowledge the attempt, ask one targeted follow-up "
+        "or next question, and do not reveal the answer, teach the solution, or discuss grading. "
+        "Keep the response to 2-3 sentences."
+    )
+
+
+def collect_prior_user_texts(session: InterviewSession) -> list[str]:
+    return [attempt.user_text for attempt in session.attempts if attempt.user_text.strip()]
+
+
+def apply_guardrails(session: InterviewSession, user_text: str):
+    policy = get_interview_policy(session.mode)
+    prior_user_texts = collect_prior_user_texts(session)
+    return evaluate_candidate_message(user_text, policy=policy, prior_user_texts=prior_user_texts)
+
+
+def generate_interview_question(
+    prompt: str,
+    fallback: str,
+    *,
+    mode: InterviewMode = InterviewMode.HIRING,
+) -> str:
     try:
-        return generate_ai_text(prompt)
+        return generate_ai_text(prompt, mode=mode)
     except Exception as e:
         print(f"LLM error: {e}")
         return fallback
 
 
-def generate_ai_text(user_prompt: str) -> str:
+def generate_ai_text(user_prompt: str, *, mode: InterviewMode = InterviewMode.HIRING) -> str:
+    policy = get_interview_policy(mode)
     response = completion(
         model=LLM_MODEL,
         messages=[
-            {"role": "system", "content": INTERVIEWER_SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(policy)},
             {"role": "user", "content": user_prompt},
         ],
     )
@@ -289,6 +309,7 @@ async def start_session(session_id: str):
             "Hello, I am InterVo. Let's begin with a DSA warm-up: explain how you would find duplicate "
             "values in an integer array and what trade-offs you would consider."
         ),
+        mode=session.mode,
     )
 
     session.status = SessionStatus.IN_PROGRESS
@@ -329,6 +350,22 @@ async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
         return {"error": "The current question has already been answered.", **build_session_payload(session)}
 
     user_text = payload.user_text.strip()
+    guardrail = apply_guardrails(session, user_text)
+    if guardrail is not None:
+        attempt.notes.append(guardrail.note)
+        attempt.user_text = user_text
+        attempt.ai_text = guardrail.response_text
+        session.last_user_text = user_text
+        session.last_ai_text = guardrail.response_text
+        interview_store.record_event(
+            session.id,
+            f"guardrail_{guardrail.category.value}",
+            guardrail.note,
+        )
+        interview_store.upsert_session(session)
+        save_response_audio(guardrail.response_text)
+        return {"status": "guardrail_triggered", "ai_text": guardrail.response_text, **build_session_payload(session)}
+
     attempt.user_text = user_text
     attempt.submitted_at = utc_now()
     attempt.state = QuestionState.SUBMITTED
@@ -378,6 +415,7 @@ async def advance_session(session_id: str, payload: SessionAdvancePayload):
             "Let's go deeper. Walk me through how you would optimize a brute-force solution for checking "
             "whether two strings are anagrams, including time and space complexity."
         ),
+        mode=session.mode,
     )
 
     create_session_attempt(
@@ -408,18 +446,25 @@ def get_session_scorecard(session_id: str):
 async def submit_answer(payload: AnswerPayload):
     """Receives user text, runs the configured LLM, and generates TTS audio."""
     user_text = payload.user_text.strip()
+    legacy_session = get_legacy_session()
+    guardrail = evaluate_candidate_message(
+        user_text,
+        policy=get_interview_policy(legacy_session.mode),
+        prior_user_texts=collect_prior_user_texts(legacy_session),
+    )
     update_legacy_transcript(user_text=user_text)
     print(f"SUBMIT: User text: {user_text}")
 
-    if user_text:
+    if guardrail is not None:
+        interview_store.record_event(
+            legacy_session.id,
+            f"guardrail_{guardrail.category.value}",
+            guardrail.note,
+        )
+        ai_text = guardrail.response_text
+    elif user_text:
         try:
-            ai_text = generate_ai_text(
-                f"The candidate said: {user_text}. "
-                "Respond naturally as InterVo: briefly evaluate or acknowledge "
-                "their answer, provide a tiny hint or correction if their math "
-                "concept was slightly off, and ask the next math-related question. "
-                "Keep your response strictly to 2-3 sentences."
-            )
+            ai_text = generate_ai_text(build_legacy_answer_prompt(user_text), mode=legacy_session.mode)
         except Exception as e:
             print(f"LLM error: {e}")
             ai_text = "Thank you for your answer. Let's move on to the next question."
@@ -438,11 +483,7 @@ async def start_interview():
     print("START INTERVIEW: Generating opening question...")
 
     try:
-        ai_text = generate_ai_text(
-            "Start the interview with a warm greeting, introduce yourself as "
-            "InterVo, and ask the candidate a thought-provoking introductory "
-            "math question. Keep your response strictly to 2-3 sentences."
-        )
+        ai_text = generate_ai_text(build_opening_question_prompt(), mode=InterviewMode.HIRING)
     except Exception as e:
         print(f"LLM error: {e}")
         ai_text = (
@@ -488,18 +529,35 @@ async def process_audio(file: UploadFile = File(...)):
         return {"error": f"FFmpeg failed: {str(e)}"}
 
     user_text = ""
+    legacy_session = get_legacy_session()
+    guardrail = None
     try:
         user_text = transcribe_wav(wav_filename)
+        guardrail = evaluate_candidate_message(
+            user_text,
+            policy=get_interview_policy(legacy_session.mode),
+            prior_user_texts=collect_prior_user_texts(legacy_session),
+        )
         update_legacy_transcript(user_text=user_text)
         print(f"User said: {user_text}")
     except Exception as e:
         print(f"Whisper STT error: {e}")
 
     if user_text:
-        try:
-            ai_text = generate_ai_text(
-                f"The user said: {user_text}. Reply in 1 brief sentence about math."
+        if guardrail is not None:
+            interview_store.record_event(
+                legacy_session.id,
+                f"guardrail_{guardrail.category.value}",
+                guardrail.note,
             )
+            ai_text = guardrail.response_text
+            update_legacy_transcript(ai_text=ai_text)
+            print(f"AI Response: {ai_text}")
+            save_response_audio(ai_text)
+            return FileResponse("response.mp3", media_type="audio/mpeg")
+
+        try:
+            ai_text = generate_ai_text(build_legacy_answer_prompt(user_text), mode=legacy_session.mode)
         except Exception as e:
             print(f"LLM error: {e}")
             ai_text = "I am having trouble thinking."
