@@ -6,16 +6,20 @@ import static_ffmpeg
 static_ffmpeg.add_paths()
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from gtts import gTTS
 from interview_domain import (
+    ALLOWED_QUESTION_STATES,
+    ALLOWED_SESSION_STATES,
     InMemoryInterviewStore,
     InterviewMode,
+    InterviewSession,
     QuestionAttempt,
     QuestionState,
     SessionStatus,
+    utc_now,
 )
 from litellm import completion
 from pydantic import BaseModel
@@ -24,6 +28,7 @@ from pydub import AudioSegment
 load_dotenv()
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini/gemini-2.5-flash")
+DEFAULT_SESSION_TIME_CAP_SECONDS = 300
 INTERVIEWER_SYSTEM_PROMPT = (
     "You are InterVo, a professional mathematics interviewer conducting an "
     "admission interview for SST. Your goal is to help candidates clarify "
@@ -96,6 +101,80 @@ def update_legacy_transcript(*, user_text: str | None = None, ai_text: str | Non
     interview_store.upsert_session(session)
 
 
+def require_session_or_404(session_id: str) -> InterviewSession:
+    try:
+        return interview_store.require_session(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def create_session_attempt(
+    session: InterviewSession,
+    *,
+    question_id: str,
+    question_title: str,
+    prompt: str,
+    time_cap_seconds: int = DEFAULT_SESSION_TIME_CAP_SECONDS,
+) -> QuestionAttempt:
+    attempt = QuestionAttempt(
+        question_id=question_id,
+        question_title=question_title,
+        ai_text=prompt,
+        state=QuestionState.ACTIVE,
+        time_cap_seconds=time_cap_seconds,
+    )
+    session.current_question_id = question_id
+    session.current_attempt_id = attempt.id
+    session.last_ai_text = prompt
+    session.attempts.append(attempt)
+    return attempt
+
+
+def get_current_attempt(session: InterviewSession) -> QuestionAttempt | None:
+    if not session.current_attempt_id:
+        return None
+
+    for attempt in reversed(session.attempts):
+        if attempt.id == session.current_attempt_id:
+            return attempt
+
+    return None
+
+
+def build_session_payload(session: InterviewSession) -> dict:
+    current_attempt = get_current_attempt(session)
+    return {
+        "session": session.model_dump(mode="json"),
+        "current_attempt": current_attempt.model_dump(mode="json") if current_attempt else None,
+        "allowed_session_states": ALLOWED_SESSION_STATES,
+        "allowed_question_states": ALLOWED_QUESTION_STATES,
+    }
+
+
+def build_opening_question_prompt() -> str:
+    return (
+        "Start a DSA hiring interview. Introduce yourself as InterVo, keep a professional tone, "
+        "and ask one opening data structures or algorithms question in 2-3 sentences."
+    )
+
+
+def build_next_question_prompt(session: InterviewSession) -> str:
+    answered_count = sum(1 for attempt in session.attempts if attempt.user_text.strip())
+    return (
+        f"The candidate has answered {answered_count} question(s). "
+        f"The latest answer was: {session.last_user_text or 'No answer captured.'} "
+        "Ask the next DSA interview question in 2-3 sentences without revealing the solution."
+    )
+
+
+def generate_interview_question(prompt: str, fallback: str) -> str:
+    try:
+        return generate_ai_text(prompt)
+    except Exception as e:
+        print(f"LLM error: {e}")
+        return fallback
+
+
 def generate_ai_text(user_prompt: str) -> str:
     response = completion(
         model=LLM_MODEL,
@@ -166,6 +245,163 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
 class AnswerPayload(BaseModel):
     user_text: str
+
+
+class SessionCreatePayload(BaseModel):
+    mode: InterviewMode = InterviewMode.HIRING
+    template_id: str | None = None
+    session_id: str | None = None
+
+
+class SessionAnswerPayload(BaseModel):
+    user_text: str
+
+
+class SessionAdvancePayload(BaseModel):
+    reason: str = "manual_advance"
+
+
+@app.post("/sessions")
+async def create_session(payload: SessionCreatePayload):
+    session = interview_store.create_session(
+        template_id=payload.template_id,
+        mode=payload.mode,
+        session_id=payload.session_id,
+        status=SessionStatus.READY,
+    )
+    interview_store.record_event(session.id, "session_created", "Session created via API.")
+    return build_session_payload(session)
+
+
+@app.post("/sessions/{session_id}/start")
+async def start_session(session_id: str):
+    session = require_session_or_404(session_id)
+
+    if session.status not in {SessionStatus.DRAFT, SessionStatus.READY}:
+        return {
+            "error": f"Session cannot start from status {session.status.value}.",
+            **build_session_payload(session),
+        }
+
+    opening_prompt = generate_interview_question(
+        build_opening_question_prompt(),
+        (
+            "Hello, I am InterVo. Let's begin with a DSA warm-up: explain how you would find duplicate "
+            "values in an integer array and what trade-offs you would consider."
+        ),
+    )
+
+    session.status = SessionStatus.IN_PROGRESS
+    session.started_at = session.started_at or utc_now()
+    create_session_attempt(
+        session,
+        question_id=f"{session.id}-question-1",
+        question_title="Opening interview question",
+        prompt=opening_prompt,
+    )
+    interview_store.record_event(session.id, "session_started", "Opening interview question issued.")
+    interview_store.upsert_session(session)
+    save_response_audio(opening_prompt)
+    return {"status": "ok", "ai_text": opening_prompt, **build_session_payload(session)}
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    session = require_session_or_404(session_id)
+    return build_session_payload(session)
+
+
+@app.post("/sessions/{session_id}/answers")
+async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
+    session = require_session_or_404(session_id)
+
+    if session.status != SessionStatus.IN_PROGRESS:
+        return {
+            "error": f"Answers are not accepted while session status is {session.status.value}.",
+            **build_session_payload(session),
+        }
+
+    attempt = get_current_attempt(session)
+    if attempt is None:
+        return {"error": "No active question exists for this session.", **build_session_payload(session)}
+
+    if attempt.state in {QuestionState.SUBMITTED, QuestionState.SCORED, QuestionState.ADVANCED}:
+        return {"error": "The current question has already been answered.", **build_session_payload(session)}
+
+    user_text = payload.user_text.strip()
+    attempt.user_text = user_text
+    attempt.submitted_at = utc_now()
+    attempt.state = QuestionState.SUBMITTED
+    session.last_user_text = user_text
+    session.status = SessionStatus.REVIEW_PENDING
+
+    ai_text = (
+        "Answer captured. The interviewer will review this response and move to the next question when ready."
+    )
+    attempt.ai_text = ai_text
+    session.last_ai_text = ai_text
+
+    interview_store.record_event(session.id, "answer_submitted", f"Answer submitted for {attempt.question_id}.")
+    interview_store.upsert_session(session)
+    save_response_audio(ai_text)
+    return {"status": "ok", "ai_text": ai_text, **build_session_payload(session)}
+
+
+@app.post("/sessions/{session_id}/advance")
+async def advance_session(session_id: str, payload: SessionAdvancePayload):
+    session = require_session_or_404(session_id)
+    current_attempt = get_current_attempt(session)
+
+    if session.status not in {SessionStatus.IN_PROGRESS, SessionStatus.REVIEW_PENDING}:
+        return {
+            "error": f"Session cannot advance from status {session.status.value}.",
+            **build_session_payload(session),
+        }
+
+    if current_attempt is not None and current_attempt.state not in {
+        QuestionState.SUBMITTED,
+        QuestionState.SCORED,
+        QuestionState.ADVANCED,
+    }:
+        return {
+            "error": "Current question must be submitted before advancing.",
+            **build_session_payload(session),
+        }
+
+    if current_attempt is not None:
+        current_attempt.state = QuestionState.ADVANCED
+
+    next_question_number = len(session.attempts) + 1
+    next_prompt = generate_interview_question(
+        build_next_question_prompt(session),
+        (
+            "Let's go deeper. Walk me through how you would optimize a brute-force solution for checking "
+            "whether two strings are anagrams, including time and space complexity."
+        ),
+    )
+
+    create_session_attempt(
+        session,
+        question_id=f"{session.id}-question-{next_question_number}",
+        question_title=f"Interview question {next_question_number}",
+        prompt=next_prompt,
+    )
+    session.status = SessionStatus.IN_PROGRESS
+
+    interview_store.record_event(session.id, "question_advanced", payload.reason)
+    interview_store.upsert_session(session)
+    save_response_audio(next_prompt)
+    return {"status": "ok", "ai_text": next_prompt, **build_session_payload(session)}
+
+
+@app.get("/sessions/{session_id}/scorecard")
+def get_session_scorecard(session_id: str):
+    session = require_session_or_404(session_id)
+    return {
+        "session_id": session.id,
+        "status": session.status.value,
+        "scorecard": session.scorecard.model_dump(mode="json"),
+    }
 
 
 @app.post("/submit-answer")
