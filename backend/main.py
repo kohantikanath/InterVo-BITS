@@ -10,6 +10,13 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from gtts import gTTS
+from interview_domain import (
+    InMemoryInterviewStore,
+    InterviewMode,
+    QuestionAttempt,
+    QuestionState,
+    SessionStatus,
+)
 from litellm import completion
 from pydantic import BaseModel
 from pydub import AudioSegment
@@ -30,10 +37,9 @@ AudioSegment.ffprobe = shutil.which("ffprobe")
 
 app = FastAPI()
 
-# In-memory transcript state.
-last_user_text: str = ""
-last_ai_text: str = ""
 whisper_model = None
+interview_store = InMemoryInterviewStore()
+LEGACY_SESSION_ID = "legacy-singleton-session"
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +48,52 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def get_legacy_session():
+    return interview_store.get_or_create_session(
+        LEGACY_SESSION_ID,
+        mode=InterviewMode.HIRING,
+        status=SessionStatus.READY,
+    )
+
+
+def ensure_legacy_attempt() -> QuestionAttempt:
+    session = get_legacy_session()
+    if session.attempts and session.current_attempt_id == session.attempts[-1].id:
+        return session.attempts[-1]
+
+    attempt = QuestionAttempt(
+        question_id="legacy-live-question",
+        question_title="Legacy interview loop",
+        state=QuestionState.READY,
+    )
+    session.current_attempt_id = attempt.id
+    session.attempts.append(attempt)
+    interview_store.upsert_session(session)
+    return attempt
+
+
+def update_legacy_transcript(*, user_text: str | None = None, ai_text: str | None = None) -> None:
+    session = get_legacy_session()
+    attempt = ensure_legacy_attempt()
+
+    if user_text is not None:
+        session.last_user_text = user_text
+        attempt.user_text = user_text
+        attempt.state = QuestionState.SUBMITTED if user_text else QuestionState.READY
+    if ai_text is not None:
+        session.last_ai_text = ai_text
+        attempt.ai_text = ai_text
+        if ai_text:
+            attempt.state = QuestionState.SCORED
+
+    interview_store.record_event(
+        session.id,
+        "legacy_transcript_updated",
+        f"user_text={'yes' if user_text is not None else 'no'}, ai_text={'yes' if ai_text is not None else 'no'}",
+    )
+    interview_store.upsert_session(session)
 
 
 def generate_ai_text(user_prompt: str) -> str:
@@ -94,7 +146,6 @@ def transcribe_wav(wav_filename: str) -> str:
 @app.post("/transcribe-audio")
 async def transcribe_audio(file: UploadFile = File(...)):
     """Transcribes uploaded audio with Whisper and returns the text."""
-    global last_user_text
     print(f"TRANSCRIBE: Processing file: {file.filename}")
 
     try:
@@ -105,7 +156,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     try:
         user_text = transcribe_wav(wav_filename)
-        last_user_text = user_text
+        update_legacy_transcript(user_text=user_text)
         print(f"TRANSCRIBE: User said: {user_text}")
         return {"user_text": user_text}
     except Exception as e:
@@ -120,10 +171,8 @@ class AnswerPayload(BaseModel):
 @app.post("/submit-answer")
 async def submit_answer(payload: AnswerPayload):
     """Receives user text, runs the configured LLM, and generates TTS audio."""
-    global last_user_text, last_ai_text
-
     user_text = payload.user_text.strip()
-    last_user_text = user_text
+    update_legacy_transcript(user_text=user_text)
     print(f"SUBMIT: User text: {user_text}")
 
     if user_text:
@@ -141,7 +190,7 @@ async def submit_answer(payload: AnswerPayload):
     else:
         ai_text = "I couldn't hear you clearly. Could you please repeat your answer?"
 
-    last_ai_text = ai_text
+    update_legacy_transcript(ai_text=ai_text)
     print(f"SUBMIT: AI Response: {ai_text}")
 
     save_response_audio(ai_text)
@@ -150,7 +199,6 @@ async def submit_answer(payload: AnswerPayload):
 
 @app.post("/start-interview")
 async def start_interview():
-    global last_ai_text
     print("START INTERVIEW: Generating opening question...")
 
     try:
@@ -167,7 +215,10 @@ async def start_interview():
             "concept you recently learned?"
         )
 
-    last_ai_text = ai_text
+    session = get_legacy_session()
+    session.status = SessionStatus.IN_PROGRESS
+    interview_store.upsert_session(session)
+    update_legacy_transcript(ai_text=ai_text)
     print(f"Opening question: {ai_text}")
     save_response_audio(ai_text)
     return {"status": "ok", "ai_text": ai_text}
@@ -180,18 +231,19 @@ def get_audio():
 
 @app.get("/get-transcript")
 def get_transcript():
-    return {"user_text": last_user_text}
+    session = get_legacy_session()
+    return {"user_text": session.last_user_text}
 
 
 @app.get("/get-ai-transcript")
 def get_ai_transcript():
-    return {"ai_text": last_ai_text}
+    session = get_legacy_session()
+    return {"ai_text": session.last_ai_text}
 
 
 @app.post("/process-audio")
 async def process_audio(file: UploadFile = File(...)):
     """Legacy endpoint: transcribes audio, runs the configured LLM, and returns TTS."""
-    global last_user_text, last_ai_text
     print(f"PROCESS-AUDIO: {file.filename}")
 
     try:
@@ -202,7 +254,7 @@ async def process_audio(file: UploadFile = File(...)):
     user_text = ""
     try:
         user_text = transcribe_wav(wav_filename)
-        last_user_text = user_text
+        update_legacy_transcript(user_text=user_text)
         print(f"User said: {user_text}")
     except Exception as e:
         print(f"Whisper STT error: {e}")
@@ -218,7 +270,7 @@ async def process_audio(file: UploadFile = File(...)):
     else:
         ai_text = "I couldn't hear you."
 
-    last_ai_text = ai_text
+    update_legacy_transcript(ai_text=ai_text)
     print(f"AI Response: {ai_text}")
 
     save_response_audio(ai_text)
