@@ -25,6 +25,7 @@ from interview_policy import build_system_prompt, evaluate_candidate_message, ge
 from litellm import completion
 from pydantic import BaseModel
 from pydub import AudioSegment
+from question_bank import default_template_id_for_mode, seed_question_bank
 
 load_dotenv()
 
@@ -39,6 +40,7 @@ app = FastAPI()
 
 whisper_model = None
 interview_store = InMemoryInterviewStore()
+seed_question_bank(interview_store)
 LEGACY_SESSION_ID = "legacy-singleton-session"
 
 app.add_middleware(
@@ -53,6 +55,7 @@ app.add_middleware(
 def get_legacy_session():
     return interview_store.get_or_create_session(
         LEGACY_SESSION_ID,
+        template_id=default_template_id_for_mode(InterviewMode.HIRING),
         mode=InterviewMode.HIRING,
         status=SessionStatus.READY,
     )
@@ -175,6 +178,27 @@ def collect_prior_user_texts(session: InterviewSession) -> list[str]:
     return [attempt.user_text for attempt in session.attempts if attempt.user_text.strip()]
 
 
+def get_template_for_session(session: InterviewSession):
+    template_id = session.template_id or default_template_id_for_mode(session.mode)
+    template = interview_store.templates.get(template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail=f"Unknown interview template: {template_id}")
+    return template
+
+
+def get_question_for_session_index(session: InterviewSession, question_index: int):
+    template = get_template_for_session(session)
+    max_questions = min(template.default_question_count, len(template.question_ids))
+    if question_index < 0 or question_index >= max_questions:
+        return None
+
+    question_id = template.question_ids[question_index]
+    question = interview_store.questions.get(question_id)
+    if question is None:
+        raise HTTPException(status_code=404, detail=f"Unknown interview question: {question_id}")
+    return question
+
+
 def apply_guardrails(session: InterviewSession, user_text: str):
     policy = get_interview_policy(session.mode)
     prior_user_texts = collect_prior_user_texts(session)
@@ -283,8 +307,12 @@ class SessionAdvancePayload(BaseModel):
 
 @app.post("/sessions")
 async def create_session(payload: SessionCreatePayload):
+    template_id = payload.template_id or default_template_id_for_mode(payload.mode)
+    if template_id not in interview_store.templates:
+        raise HTTPException(status_code=404, detail=f"Unknown interview template: {template_id}")
+
     session = interview_store.create_session(
-        template_id=payload.template_id,
+        template_id=template_id,
         mode=payload.mode,
         session_id=payload.session_id,
         status=SessionStatus.READY,
@@ -303,22 +331,20 @@ async def start_session(session_id: str):
             **build_session_payload(session),
         }
 
-    opening_prompt = generate_interview_question(
-        build_opening_question_prompt(),
-        (
-            "Hello, I am InterVo. Let's begin with a DSA warm-up: explain how you would find duplicate "
-            "values in an integer array and what trade-offs you would consider."
-        ),
-        mode=session.mode,
-    )
+    opening_question = get_question_for_session_index(session, 0)
+    if opening_question is None:
+        raise HTTPException(status_code=400, detail="Selected template does not contain any interview questions.")
+
+    opening_prompt = opening_question.prompt
 
     session.status = SessionStatus.IN_PROGRESS
     session.started_at = session.started_at or utc_now()
     create_session_attempt(
         session,
-        question_id=f"{session.id}-question-1",
-        question_title="Opening interview question",
+        question_id=opening_question.id,
+        question_title=opening_question.title,
         prompt=opening_prompt,
+        time_cap_seconds=opening_question.time_cap_seconds,
     )
     interview_store.record_event(session.id, "session_started", "Opening interview question issued.")
     interview_store.upsert_session(session)
@@ -408,21 +434,26 @@ async def advance_session(session_id: str, payload: SessionAdvancePayload):
     if current_attempt is not None:
         current_attempt.state = QuestionState.ADVANCED
 
-    next_question_number = len(session.attempts) + 1
-    next_prompt = generate_interview_question(
-        build_next_question_prompt(session),
-        (
-            "Let's go deeper. Walk me through how you would optimize a brute-force solution for checking "
-            "whether two strings are anagrams, including time and space complexity."
-        ),
-        mode=session.mode,
-    )
+    next_question_index = len(session.attempts)
+    next_question = get_question_for_session_index(session, next_question_index)
+    if next_question is None:
+        session.status = SessionStatus.COMPLETED
+        session.completed_at = utc_now()
+        interview_store.record_event(session.id, "session_completed", payload.reason)
+        interview_store.upsert_session(session)
+        return {
+            "status": "completed",
+            "ai_text": "This interview session is complete. A recruiter scorecard can now be generated.",
+            **build_session_payload(session),
+        }
 
+    next_prompt = next_question.prompt
     create_session_attempt(
         session,
-        question_id=f"{session.id}-question-{next_question_number}",
-        question_title=f"Interview question {next_question_number}",
+        question_id=next_question.id,
+        question_title=next_question.title,
         prompt=next_prompt,
+        time_cap_seconds=next_question.time_cap_seconds,
     )
     session.status = SessionStatus.IN_PROGRESS
 
@@ -483,16 +514,19 @@ async def start_interview():
     print("START INTERVIEW: Generating opening question...")
 
     try:
-        ai_text = generate_ai_text(build_opening_question_prompt(), mode=InterviewMode.HIRING)
+        session = get_legacy_session()
+        opening_question = get_question_for_session_index(session, 0)
+        if opening_question is None:
+            raise ValueError("No questions found for the legacy interview template.")
+        ai_text = opening_question.prompt
     except Exception as e:
-        print(f"LLM error: {e}")
+        print(f"Question bank error: {e}")
+        session = get_legacy_session()
         ai_text = (
-            "Hello! I am InterVo, your mathematics interviewer. Let's start "
-            "with a warm-up: Can you explain an interesting mathematical "
-            "concept you recently learned?"
+            "Let's start with a DSA warm-up: explain how you would find duplicate values in an integer array "
+            "and what trade-offs you would consider."
         )
 
-    session = get_legacy_session()
     session.status = SessionStatus.IN_PROGRESS
     interview_store.upsert_session(session)
     update_legacy_transcript(ai_text=ai_text)
