@@ -108,6 +108,26 @@ class DimensionScore(BaseModel):
     evidence: List[ScoreEvidence] = Field(default_factory=list)
 
 
+class QuestionScorecardEntry(BaseModel):
+    question_id: str
+    question_title: str
+    source_type: str = "question"
+    state: QuestionState
+    prompt_text: str = ""
+    answer_text: str = ""
+    evaluation_summary: str = ""
+    recommended_next_step: str = ""
+    score_average: Optional[float] = None
+    dimension_scores: List[DimensionScore] = Field(default_factory=list)
+    evidence: List[ScoreEvidence] = Field(default_factory=list)
+    concepts_demonstrated: List[str] = Field(default_factory=list)
+    missing_concepts: List[str] = Field(default_factory=list)
+    started_at: Optional[datetime] = None
+    submitted_at: Optional[datetime] = None
+    expired: bool = False
+    lock_reason: str = ""
+
+
 class QuestionAttempt(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     question_id: Optional[str] = None
@@ -142,11 +162,15 @@ class FinalScorecard(BaseModel):
     questions_expected: int = 0
     recommendation: Optional[RecommendationBand] = None
     summary: str = ""
+    overall_average: Optional[float] = None
+    recommendation_rationale: str = ""
+    recommendation_blocked_reason: str = ""
     dimension_scores: List[DimensionScore] = Field(default_factory=list)
     strengths: List[str] = Field(default_factory=list)
     risks: List[str] = Field(default_factory=list)
     unanswered_concerns: List[str] = Field(default_factory=list)
     evidence: List[ScoreEvidence] = Field(default_factory=list)
+    question_summaries: List[QuestionScorecardEntry] = Field(default_factory=list)
     generated_at: Optional[datetime] = None
 
 

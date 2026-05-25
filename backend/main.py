@@ -20,6 +20,7 @@ from interview_domain import (
     InterviewMode,
     InterviewSession,
     QuestionAttempt,
+    QuestionScorecardEntry,
     QuestionState,
     Question,
     RecommendationBand,
@@ -254,6 +255,14 @@ def latest_attempts_by_question(session: InterviewSession) -> list[QuestionAttem
     return list(latest.values())
 
 
+def latest_attempt_by_key(session: InterviewSession) -> dict[tuple[str, str], QuestionAttempt]:
+    latest: dict[tuple[str, str], QuestionAttempt] = {}
+    for attempt in session.attempts:
+        if attempt.question_id:
+            latest[(attempt.question_id, attempt.source_type)] = attempt
+    return latest
+
+
 def is_attempt_rubric_complete(question: Question, attempt: QuestionAttempt) -> bool:
     dimension_keys = [dimension.key for dimension in question.rubric.dimensions]
     score_map = {score.dimension: score for score in attempt.scores}
@@ -289,20 +298,145 @@ def aggregate_dimension_scores(attempts: list[QuestionAttempt]) -> list[Dimensio
     return sorted(merged_scores, key=lambda score: score.dimension)
 
 
-def build_recommendation(average_score: float) -> RecommendationBand:
-    if average_score >= 4.2:
+def average_dimension_score(scores: list[DimensionScore]) -> float | None:
+    numeric_scores = [score.score for score in scores if score.score is not None]
+    if not numeric_scores:
+        return None
+    return round(sum(numeric_scores) / len(numeric_scores), 2)
+
+
+def build_recommendation(
+    average_score: float,
+    *,
+    low_dimension_count: int = 0,
+    critical_dimension_scores: dict[str, float] | None = None,
+) -> RecommendationBand:
+    critical_dimension_scores = critical_dimension_scores or {}
+    lowest_critical = min(critical_dimension_scores.values(), default=average_score)
+
+    if average_score >= 4.2 and lowest_critical >= 3.8 and low_dimension_count == 0:
         return RecommendationBand.STRONG_HIRE
-    if average_score >= 3.5:
+    if average_score >= 3.4 and lowest_critical >= 3.0 and low_dimension_count <= 1:
         return RecommendationBand.HIRE
     if average_score >= 2.6:
         return RecommendationBand.MIXED
     return RecommendationBand.NO_HIRE
 
 
+def humanize_dimension(dimension_key: str) -> str:
+    return dimension_key.replace("_", " ")
+
+
+def question_average(attempt: QuestionAttempt) -> float | None:
+    return average_dimension_score(attempt.scores)
+
+
+def build_question_scorecard_entry(attempt: QuestionAttempt) -> QuestionScorecardEntry:
+    evidence: list[ScoreEvidence] = []
+    for score in attempt.scores:
+        evidence.extend(score.evidence[:1])
+
+    return QuestionScorecardEntry(
+        question_id=attempt.question_id or "",
+        question_title=attempt.question_title or "",
+        source_type=attempt.source_type,
+        state=attempt.state,
+        prompt_text=attempt.prompt_text,
+        answer_text=attempt.user_text,
+        evaluation_summary=attempt.evaluation_summary,
+        recommended_next_step=attempt.recommended_next_step,
+        score_average=question_average(attempt),
+        dimension_scores=attempt.scores,
+        evidence=evidence[:3],
+        concepts_demonstrated=attempt.expected_concepts_hit,
+        missing_concepts=attempt.missing_concepts,
+        started_at=attempt.started_at,
+        submitted_at=attempt.submitted_at,
+        expired=attempt.state == QuestionState.EXPIRED,
+        lock_reason=attempt.lock_reason,
+    )
+
+
+def build_question_summaries(session: InterviewSession, template_question_ids: list[str]) -> list[QuestionScorecardEntry]:
+    latest_attempts = latest_attempt_by_key(session)
+    ordered_entries: list[QuestionScorecardEntry] = []
+
+    for question_id in template_question_ids:
+        primary_attempt = latest_attempts.get((question_id, "question"))
+        if primary_attempt is not None:
+            ordered_entries.append(build_question_scorecard_entry(primary_attempt))
+
+        follow_up_attempt = latest_attempts.get((question_id, "follow_up"))
+        if follow_up_attempt is not None:
+            ordered_entries.append(build_question_scorecard_entry(follow_up_attempt))
+
+    return ordered_entries
+
+
+def build_unanswered_concerns(
+    attempts: list[QuestionAttempt],
+    question_entries: list[QuestionScorecardEntry],
+) -> list[str]:
+    concerns: list[str] = []
+    for attempt in attempts:
+        if attempt.state == QuestionState.EXPIRED:
+            concerns.append(
+                f"{attempt.question_title or attempt.question_id}: time expired before a complete evaluation."
+            )
+            continue
+
+        if attempt.missing_concepts:
+            focus = ", ".join(attempt.missing_concepts[:2])
+            concerns.append(
+                f"{attempt.question_title or attempt.question_id}: candidate did not clearly cover {focus}."
+            )
+
+    if not concerns:
+        low_scoring_entries = [
+            entry
+            for entry in question_entries
+            if entry.score_average is not None and entry.score_average < 3.0
+        ]
+        for entry in low_scoring_entries[:2]:
+            concerns.append(
+                f"{entry.question_title}: overall signal remained below the hiring bar and needs recruiter review."
+            )
+
+    return concerns[:4]
+
+
+def build_scorecard_summary(
+    session: InterviewSession,
+    scorecard: FinalScorecard,
+    strongest_dimensions: list[str],
+    weakest_dimensions: list[str],
+) -> str:
+    if scorecard.recommendation_ready and scorecard.overall_average is not None:
+        strength_text = ", ".join(strongest_dimensions[:2]) if strongest_dimensions else "balanced performance"
+        risk_text = ", ".join(weakest_dimensions[:2]) if weakest_dimensions else "no major weak spots"
+        return (
+            f"Completed {scorecard.attempts_graded}/{scorecard.questions_expected} scored questions with an overall "
+            f"average of {scorecard.overall_average:.2f}. Strongest areas: {strength_text}. "
+            f"Primary risks: {risk_text}."
+        )
+
+    if session.status != SessionStatus.COMPLETED:
+        return (
+            f"Interview still in progress. {scorecard.attempts_graded}/{scorecard.questions_expected} primary "
+            "question rubric(s) are fully scored so far."
+        )
+
+    return (
+        f"Interview finished, but the recruiter scorecard is incomplete. "
+        f"{scorecard.attempts_graded}/{scorecard.questions_expected} primary question rubric(s) have complete scoring."
+    )
+
+
 def refresh_scorecard(session: InterviewSession) -> FinalScorecard:
     template = get_template_for_session(session)
+    expected_question_ids = template.question_ids[: min(template.default_question_count, len(template.question_ids))]
     latest_attempts = latest_attempts_by_question(session)
-    expected_questions = min(template.default_question_count, len(template.question_ids))
+    expected_questions = len(expected_question_ids)
     complete_attempts: list[QuestionAttempt] = []
     rubric_complete = True
 
@@ -326,34 +460,72 @@ def refresh_scorecard(session: InterviewSession) -> FinalScorecard:
         attempts_graded=len(complete_attempts),
         questions_expected=expected_questions,
     )
+    scorecard.question_summaries = build_question_summaries(session, expected_question_ids)
 
     if complete_attempts:
         scorecard.dimension_scores = aggregate_dimension_scores(complete_attempts)
-        scorecard.evidence = [evidence for score in scorecard.dimension_scores for evidence in score.evidence[:1]]
+        scorecard.evidence = [evidence for score in scorecard.dimension_scores for evidence in score.evidence[:1]][:8]
         scorecard.strengths = [
-            score.dimension.replace("_", " ")
+            humanize_dimension(score.dimension)
             for score in scorecard.dimension_scores
             if score.score is not None and score.score >= 4.0
         ]
         scorecard.risks = [
-            score.dimension.replace("_", " ")
+            humanize_dimension(score.dimension)
             for score in scorecard.dimension_scores
-            if score.score is not None and score.score <= 2.8
+            if score.score is not None and score.score <= 3.0
         ]
-
-    if scorecard.recommendation_ready and scorecard.dimension_scores:
-        numeric_scores = [score.score for score in scorecard.dimension_scores if score.score is not None]
-        overall_average = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
-        scorecard.recommendation = build_recommendation(overall_average)
-        scorecard.summary = (
-            f"Rubric grading complete across {len(complete_attempts)} question(s) with an average score of "
-            f"{overall_average:.2f}."
+        scorecard.overall_average = average_dimension_score(scorecard.dimension_scores)
+        scorecard.unanswered_concerns = build_unanswered_concerns(
+            latest_attempts,
+            scorecard.question_summaries,
         )
+
+    strongest_dimensions = scorecard.strengths
+    weakest_dimensions = scorecard.risks
+
+    if scorecard.recommendation_ready and scorecard.dimension_scores and scorecard.overall_average is not None:
+        critical_dimensions = {
+            score.dimension: score.score
+            for score in scorecard.dimension_scores
+            if score.score is not None and score.dimension in {"problem_understanding", "correctness"}
+        }
+        low_dimension_count = sum(
+            1
+            for score in scorecard.dimension_scores
+            if score.score is not None and score.score < 3.0
+        )
+        scorecard.recommendation = build_recommendation(
+            scorecard.overall_average,
+            low_dimension_count=low_dimension_count,
+            critical_dimension_scores=critical_dimensions,
+        )
+        strongest_text = ", ".join(strongest_dimensions[:2]) if strongest_dimensions else "balanced rubric results"
+        weakest_text = ", ".join(weakest_dimensions[:2]) if weakest_dimensions else "no major rubric risks"
+        scorecard.recommendation_rationale = (
+            f"Recommendation is based on an overall rubric average of {scorecard.overall_average:.2f}, "
+            f"strong signals in {strongest_text}, and recruiter caution around {weakest_text}."
+        )
+        scorecard.recommendation_blocked_reason = ""
         scorecard.generated_at = utc_now()
     else:
-        scorecard.summary = (
-            f"Grading is not complete yet: {len(complete_attempts)}/{expected_questions} question rubric(s) are fully scored."
-        )
+        scorecard.recommendation = None
+        if session.status != SessionStatus.COMPLETED:
+            scorecard.recommendation_blocked_reason = "Interview session has not completed yet."
+        elif len(complete_attempts) != expected_questions:
+            scorecard.recommendation_blocked_reason = (
+                f"Only {len(complete_attempts)} of {expected_questions} primary question rubric(s) are fully scored."
+            )
+        else:
+            scorecard.recommendation_blocked_reason = "Rubric scoring is incomplete."
+        scorecard.recommendation_rationale = ""
+
+    scorecard.summary = build_scorecard_summary(
+        session,
+        scorecard,
+        strongest_dimensions,
+        weakest_dimensions,
+    )
 
     session.scorecard = scorecard
     interview_store.upsert_session(session)
@@ -834,7 +1006,10 @@ def get_session_scorecard(session_id: str):
     return {
         "session_id": session.id,
         "status": session.status.value,
+        "template_id": session.template_id,
         "scorecard": scorecard.model_dump(mode="json"),
+        "question_timeline": [entry.model_dump(mode="json") for entry in scorecard.question_summaries],
+        "session_events": [event.model_dump(mode="json") for event in session.events],
     }
 
 
