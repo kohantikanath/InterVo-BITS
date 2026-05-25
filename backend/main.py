@@ -18,8 +18,15 @@ from interview_domain import (
     InterviewSession,
     QuestionAttempt,
     QuestionState,
+    Question,
     SessionStatus,
     utc_now,
+)
+from interview_engine import (
+    NextStep,
+    build_interviewer_transition,
+    build_review_acknowledgement,
+    evaluate_answer,
 )
 from interview_policy import build_system_prompt, evaluate_candidate_message, get_interview_policy
 from litellm import completion
@@ -113,11 +120,16 @@ def create_session_attempt(
     question_title: str,
     prompt: str,
     time_cap_seconds: int = DEFAULT_SESSION_TIME_CAP_SECONDS,
+    source_type: str = "question",
+    selected_follow_up_id: str | None = None,
 ) -> QuestionAttempt:
     attempt = QuestionAttempt(
         question_id=question_id,
         question_title=question_title,
+        source_type=source_type,
+        prompt_text=prompt,
         ai_text=prompt,
+        selected_follow_up_id=selected_follow_up_id,
         state=QuestionState.ACTIVE,
         time_cap_seconds=time_cap_seconds,
     )
@@ -199,6 +211,26 @@ def get_question_for_session_index(session: InterviewSession, question_index: in
     return question
 
 
+def get_question_by_attempt(attempt: QuestionAttempt) -> Question:
+    question = interview_store.questions.get(attempt.question_id or "")
+    if question is None:
+        raise HTTPException(status_code=404, detail=f"Unknown interview question: {attempt.question_id}")
+    return question
+
+
+def get_follow_up_by_id(question: Question, follow_up_id: str | None):
+    if not follow_up_id:
+        return None
+    for follow_up in question.follow_ups:
+        if follow_up.id == follow_up_id:
+            return follow_up
+    raise HTTPException(status_code=404, detail=f"Unknown follow-up question: {follow_up_id}")
+
+
+def count_primary_attempts(session: InterviewSession) -> int:
+    return sum(1 for attempt in session.attempts if attempt.source_type == "question")
+
+
 def apply_guardrails(session: InterviewSession, user_text: str):
     policy = get_interview_policy(session.mode)
     prior_user_texts = collect_prior_user_texts(session)
@@ -228,6 +260,99 @@ def generate_ai_text(user_prompt: str, *, mode: InterviewMode = InterviewMode.HI
         ],
     )
     return response.choices[0].message.content.replace("*", "").strip()
+
+
+def persist_answer_evaluation(session: InterviewSession, attempt: QuestionAttempt, question: Question, user_text: str):
+    evaluation = evaluate_answer(question, user_text, source_type=attempt.source_type)
+    attempt.user_text = user_text
+    attempt.submitted_at = utc_now()
+    attempt.state = QuestionState.SCORED
+    attempt.evaluation_summary = evaluation.summary
+    attempt.recommended_next_step = evaluation.next_step.value
+    attempt.expected_concepts_hit = evaluation.concept_hits
+    attempt.missing_concepts = evaluation.missing_concepts
+    attempt.selected_follow_up_id = evaluation.selected_follow_up_id
+    attempt.notes.extend(evaluation.evidence)
+    session.last_user_text = user_text
+    session.status = SessionStatus.REVIEW_PENDING
+
+    ai_text = build_review_acknowledgement(evaluation)
+    attempt.ai_text = ai_text
+    session.last_ai_text = ai_text
+    interview_store.record_event(
+        session.id,
+        "answer_evaluated",
+        f"{attempt.question_id}: {evaluation.summary}",
+    )
+    interview_store.upsert_session(session)
+    return evaluation
+
+
+def advance_session_engine(session: InterviewSession, *, reason: str) -> tuple[str, dict]:
+    current_attempt = get_current_attempt(session)
+    if current_attempt is None:
+        raise HTTPException(status_code=400, detail="No active question exists for this session.")
+
+    if current_attempt.state not in {QuestionState.SCORED, QuestionState.SUBMITTED, QuestionState.ADVANCED}:
+        raise HTTPException(status_code=400, detail="Current question must be evaluated before advancing.")
+
+    question = get_question_by_attempt(current_attempt)
+    current_attempt.state = QuestionState.ADVANCED
+    next_step = NextStep(current_attempt.recommended_next_step or NextStep.NEXT_QUESTION.value)
+
+    if next_step == NextStep.FOLLOW_UP:
+        follow_up = get_follow_up_by_id(question, current_attempt.selected_follow_up_id)
+        if follow_up is None:
+            next_step = NextStep.NEXT_QUESTION
+        else:
+            ai_text = build_interviewer_transition(
+                next_step=next_step,
+                follow_up=follow_up,
+                mode=session.mode,
+            )
+            create_session_attempt(
+                session,
+                question_id=question.id,
+                question_title=f"{question.title} follow-up",
+                prompt=follow_up.prompt,
+                time_cap_seconds=max(120, min(question.time_cap_seconds, 240)),
+                source_type="follow_up",
+                selected_follow_up_id=follow_up.id,
+            )
+            session.status = SessionStatus.IN_PROGRESS
+            session.last_ai_text = ai_text
+            interview_store.record_event(session.id, "question_advanced", reason)
+            interview_store.upsert_session(session)
+            return ai_text, {"next_step": next_step.value}
+
+    next_question_index = count_primary_attempts(session)
+    next_question = get_question_for_session_index(session, next_question_index)
+    if next_question is None:
+        session.status = SessionStatus.COMPLETED
+        session.completed_at = utc_now()
+        session.last_ai_text = "This interview session is complete. A recruiter scorecard can now be generated."
+        interview_store.record_event(session.id, "session_completed", reason)
+        interview_store.upsert_session(session)
+        return session.last_ai_text, {"next_step": NextStep.COMPLETE.value}
+
+    ai_text = build_interviewer_transition(
+        next_step=NextStep.NEXT_QUESTION,
+        next_question=next_question,
+        mode=session.mode,
+    )
+    create_session_attempt(
+        session,
+        question_id=next_question.id,
+        question_title=next_question.title,
+        prompt=next_question.prompt,
+        time_cap_seconds=next_question.time_cap_seconds,
+        source_type="question",
+    )
+    session.status = SessionStatus.IN_PROGRESS
+    session.last_ai_text = ai_text
+    interview_store.record_event(session.id, "question_advanced", reason)
+    interview_store.upsert_session(session)
+    return ai_text, {"next_step": NextStep.NEXT_QUESTION.value}
 
 
 def save_response_audio(ai_text: str) -> None:
@@ -376,6 +501,7 @@ async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
         return {"error": "The current question has already been answered.", **build_session_payload(session)}
 
     user_text = payload.user_text.strip()
+    question = get_question_by_attempt(attempt)
     guardrail = apply_guardrails(session, user_text)
     if guardrail is not None:
         attempt.notes.append(guardrail.note)
@@ -392,22 +518,15 @@ async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
         save_response_audio(guardrail.response_text)
         return {"status": "guardrail_triggered", "ai_text": guardrail.response_text, **build_session_payload(session)}
 
-    attempt.user_text = user_text
-    attempt.submitted_at = utc_now()
-    attempt.state = QuestionState.SUBMITTED
-    session.last_user_text = user_text
-    session.status = SessionStatus.REVIEW_PENDING
-
-    ai_text = (
-        "Answer captured. The interviewer will review this response and move to the next question when ready."
-    )
-    attempt.ai_text = ai_text
-    session.last_ai_text = ai_text
-
-    interview_store.record_event(session.id, "answer_submitted", f"Answer submitted for {attempt.question_id}.")
-    interview_store.upsert_session(session)
+    evaluation = persist_answer_evaluation(session, attempt, question, user_text)
+    ai_text = session.last_ai_text
     save_response_audio(ai_text)
-    return {"status": "ok", "ai_text": ai_text, **build_session_payload(session)}
+    return {
+        "status": "ok",
+        "ai_text": ai_text,
+        "engine_evaluation": evaluation.to_dict(),
+        **build_session_payload(session),
+    }
 
 
 @app.post("/sessions/{session_id}/advance")
@@ -422,45 +541,18 @@ async def advance_session(session_id: str, payload: SessionAdvancePayload):
         }
 
     if current_attempt is not None and current_attempt.state not in {
-        QuestionState.SUBMITTED,
         QuestionState.SCORED,
         QuestionState.ADVANCED,
     }:
         return {
-            "error": "Current question must be submitted before advancing.",
+            "error": "Current question must be evaluated before advancing.",
             **build_session_payload(session),
         }
 
-    if current_attempt is not None:
-        current_attempt.state = QuestionState.ADVANCED
-
-    next_question_index = len(session.attempts)
-    next_question = get_question_for_session_index(session, next_question_index)
-    if next_question is None:
-        session.status = SessionStatus.COMPLETED
-        session.completed_at = utc_now()
-        interview_store.record_event(session.id, "session_completed", payload.reason)
-        interview_store.upsert_session(session)
-        return {
-            "status": "completed",
-            "ai_text": "This interview session is complete. A recruiter scorecard can now be generated.",
-            **build_session_payload(session),
-        }
-
-    next_prompt = next_question.prompt
-    create_session_attempt(
-        session,
-        question_id=next_question.id,
-        question_title=next_question.title,
-        prompt=next_prompt,
-        time_cap_seconds=next_question.time_cap_seconds,
-    )
-    session.status = SessionStatus.IN_PROGRESS
-
-    interview_store.record_event(session.id, "question_advanced", payload.reason)
-    interview_store.upsert_session(session)
-    save_response_audio(next_prompt)
-    return {"status": "ok", "ai_text": next_prompt, **build_session_payload(session)}
+    ai_text, engine_decision = advance_session_engine(session, reason=payload.reason)
+    save_response_audio(ai_text)
+    status = "completed" if engine_decision["next_step"] == NextStep.COMPLETE.value else "ok"
+    return {"status": status, "ai_text": ai_text, "engine_decision": engine_decision, **build_session_payload(session)}
 
 
 @app.get("/sessions/{session_id}/scorecard")
@@ -478,6 +570,26 @@ async def submit_answer(payload: AnswerPayload):
     """Receives user text, runs the configured LLM, and generates TTS audio."""
     user_text = payload.user_text.strip()
     legacy_session = get_legacy_session()
+    current_attempt = get_current_attempt(legacy_session)
+    if current_attempt is None:
+        opening_question = get_question_for_session_index(legacy_session, 0)
+        if opening_question is not None:
+            create_session_attempt(
+                legacy_session,
+                question_id=opening_question.id,
+                question_title=opening_question.title,
+                prompt=opening_question.prompt,
+                time_cap_seconds=opening_question.time_cap_seconds,
+                source_type="question",
+            )
+            interview_store.upsert_session(legacy_session)
+            current_attempt = get_current_attempt(legacy_session)
+
+    if current_attempt is None:
+        ai_text = "I couldn't find an active interview question. Please restart the interview."
+        save_response_audio(ai_text)
+        return {"status": "error", "ai_text": ai_text}
+
     guardrail = evaluate_candidate_message(
         user_text,
         policy=get_interview_policy(legacy_session.mode),
@@ -494,11 +606,9 @@ async def submit_answer(payload: AnswerPayload):
         )
         ai_text = guardrail.response_text
     elif user_text:
-        try:
-            ai_text = generate_ai_text(build_legacy_answer_prompt(user_text), mode=legacy_session.mode)
-        except Exception as e:
-            print(f"LLM error: {e}")
-            ai_text = "Thank you for your answer. Let's move on to the next question."
+        question = get_question_by_attempt(current_attempt)
+        persist_answer_evaluation(legacy_session, current_attempt, question, user_text)
+        ai_text, _ = advance_session_engine(legacy_session, reason="legacy_submit_answer")
     else:
         ai_text = "I couldn't hear you clearly. Could you please repeat your answer?"
 
@@ -519,6 +629,15 @@ async def start_interview():
         if opening_question is None:
             raise ValueError("No questions found for the legacy interview template.")
         ai_text = opening_question.prompt
+        if not get_current_attempt(session):
+            create_session_attempt(
+                session,
+                question_id=opening_question.id,
+                question_title=opening_question.title,
+                prompt=opening_question.prompt,
+                time_cap_seconds=opening_question.time_cap_seconds,
+                source_type="question",
+            )
     except Exception as e:
         print(f"Question bank error: {e}")
         session = get_legacy_session()
@@ -590,11 +709,27 @@ async def process_audio(file: UploadFile = File(...)):
             save_response_audio(ai_text)
             return FileResponse("response.mp3", media_type="audio/mpeg")
 
-        try:
-            ai_text = generate_ai_text(build_legacy_answer_prompt(user_text), mode=legacy_session.mode)
-        except Exception as e:
-            print(f"LLM error: {e}")
-            ai_text = "I am having trouble thinking."
+        current_attempt = get_current_attempt(legacy_session)
+        if current_attempt is None:
+            opening_question = get_question_for_session_index(legacy_session, 0)
+            if opening_question is not None:
+                create_session_attempt(
+                    legacy_session,
+                    question_id=opening_question.id,
+                    question_title=opening_question.title,
+                    prompt=opening_question.prompt,
+                    time_cap_seconds=opening_question.time_cap_seconds,
+                    source_type="question",
+                )
+                interview_store.upsert_session(legacy_session)
+                current_attempt = get_current_attempt(legacy_session)
+
+        if current_attempt is None:
+            ai_text = "I couldn't find an active interview question."
+        else:
+            question = get_question_by_attempt(current_attempt)
+            persist_answer_evaluation(legacy_session, current_attempt, question, user_text)
+            ai_text, _ = advance_session_engine(legacy_session, reason="legacy_process_audio")
     else:
         ai_text = "I couldn't hear you."
 

@@ -113,8 +113,15 @@ class QuestionAttempt(BaseModel):
     question_id: Optional[str] = None
     question_title: Optional[str] = None
     state: QuestionState = QuestionState.READY
+    source_type: str = "question"
+    prompt_text: str = ""
     user_text: str = ""
     ai_text: str = ""
+    selected_follow_up_id: Optional[str] = None
+    evaluation_summary: str = ""
+    recommended_next_step: str = ""
+    expected_concepts_hit: List[str] = Field(default_factory=list)
+    missing_concepts: List[str] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=utc_now)
     submitted_at: Optional[datetime] = None
     time_cap_seconds: Optional[int] = None
@@ -216,4 +223,3 @@ class InMemoryInterviewStore:
         session = self.require_session(session_id)
         session.events.append(SessionEvent(kind=kind, detail=detail))
         return self.upsert_session(session)
-
