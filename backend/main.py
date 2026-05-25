@@ -1,5 +1,6 @@
 import os
 import shutil
+from datetime import timedelta
 
 import static_ffmpeg
 
@@ -38,6 +39,7 @@ load_dotenv()
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini/gemini-2.5-flash")
 DEFAULT_SESSION_TIME_CAP_SECONDS = 300
+DEFAULT_WARNING_THRESHOLD_SECONDS = 30
 # Set ffmpeg paths required by pydub.
 AudioSegment.converter = shutil.which("ffmpeg")
 AudioSegment.ffmpeg = shutil.which("ffmpeg")
@@ -91,11 +93,14 @@ def update_legacy_transcript(*, user_text: str | None = None, ai_text: str | Non
     if user_text is not None:
         session.last_user_text = user_text
         attempt.user_text = user_text
-        attempt.state = QuestionState.SUBMITTED if user_text else QuestionState.READY
+        if attempt.state == QuestionState.READY and user_text:
+            attempt.state = QuestionState.SUBMITTED
+        if not user_text and attempt.state == QuestionState.READY:
+            attempt.state = QuestionState.READY
     if ai_text is not None:
         session.last_ai_text = ai_text
         attempt.ai_text = ai_text
-        if ai_text:
+        if ai_text and attempt.state == QuestionState.SUBMITTED:
             attempt.state = QuestionState.SCORED
 
     interview_store.record_event(
@@ -123,6 +128,8 @@ def create_session_attempt(
     source_type: str = "question",
     selected_follow_up_id: str | None = None,
 ) -> QuestionAttempt:
+    started_at = utc_now()
+    warning_threshold_seconds = min(DEFAULT_WARNING_THRESHOLD_SECONDS, max(10, time_cap_seconds // 4))
     attempt = QuestionAttempt(
         question_id=question_id,
         question_title=question_title,
@@ -131,7 +138,10 @@ def create_session_attempt(
         ai_text=prompt,
         selected_follow_up_id=selected_follow_up_id,
         state=QuestionState.ACTIVE,
+        started_at=started_at,
         time_cap_seconds=time_cap_seconds,
+        warning_threshold_seconds=warning_threshold_seconds,
+        expires_at=started_at + timedelta(seconds=time_cap_seconds),
     )
     session.current_question_id = question_id
     session.current_attempt_id = attempt.id
@@ -156,6 +166,7 @@ def build_session_payload(session: InterviewSession) -> dict:
     return {
         "session": session.model_dump(mode="json"),
         "current_attempt": current_attempt.model_dump(mode="json") if current_attempt else None,
+        "timer": build_attempt_timer_snapshot(current_attempt) if current_attempt else None,
         "allowed_session_states": ALLOWED_SESSION_STATES,
         "allowed_question_states": ALLOWED_QUESTION_STATES,
     }
@@ -231,6 +242,97 @@ def count_primary_attempts(session: InterviewSession) -> int:
     return sum(1 for attempt in session.attempts if attempt.source_type == "question")
 
 
+def build_attempt_timer_snapshot(attempt: QuestionAttempt | None) -> dict | None:
+    if attempt is None:
+        return None
+
+    now = utc_now()
+    remaining_seconds = None
+    if attempt.expires_at is not None:
+        remaining_seconds = max(0, int((attempt.expires_at - now).total_seconds()))
+
+    return {
+        "state": attempt.state.value,
+        "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
+        "expires_at": attempt.expires_at.isoformat() if attempt.expires_at else None,
+        "warning_threshold_seconds": attempt.warning_threshold_seconds,
+        "remaining_seconds": remaining_seconds,
+        "expired": attempt.state == QuestionState.EXPIRED,
+        "locked": attempt.state in {QuestionState.EXPIRED, QuestionState.SCORED, QuestionState.ADVANCED},
+        "lock_reason": attempt.lock_reason,
+    }
+
+
+def mark_attempt_warning(session: InterviewSession, attempt: QuestionAttempt, *, reason: str) -> None:
+    if attempt.state != QuestionState.ACTIVE:
+        return
+
+    attempt.state = QuestionState.WARNING
+    attempt.warning_emitted_at = attempt.warning_emitted_at or utc_now()
+    interview_store.record_event(session.id, "timer_warning", reason)
+    interview_store.upsert_session(session)
+
+
+def mark_attempt_expired(session: InterviewSession, attempt: QuestionAttempt, *, reason: str) -> None:
+    if attempt.state == QuestionState.EXPIRED:
+        return
+
+    now = utc_now()
+    attempt.state = QuestionState.EXPIRED
+    attempt.expired_at = attempt.expired_at or now
+    attempt.locked_at = attempt.locked_at or now
+    attempt.lock_reason = "time_cap_reached"
+    attempt.recommended_next_step = NextStep.NEXT_QUESTION.value
+    if not attempt.evaluation_summary:
+        attempt.evaluation_summary = "Answer window expired before the question was evaluated."
+    session.status = SessionStatus.REVIEW_PENDING
+    interview_store.record_event(session.id, "timer_expired", reason)
+    interview_store.upsert_session(session)
+
+
+def sync_attempt_timer(
+    session: InterviewSession,
+    attempt: QuestionAttempt | None,
+    *,
+    allow_warning_transition: bool = True,
+) -> QuestionAttempt | None:
+    if attempt is None or attempt.time_cap_seconds is None or attempt.expires_at is None:
+        return attempt
+
+    if attempt.state in {QuestionState.SCORED, QuestionState.ADVANCED, QuestionState.EXPIRED}:
+        return attempt
+
+    remaining_seconds = int((attempt.expires_at - utc_now()).total_seconds())
+    if remaining_seconds <= 0:
+        mark_attempt_expired(session, attempt, reason=f"Question {attempt.question_id} reached its hard time cap.")
+        return attempt
+
+    if (
+        allow_warning_transition
+        and attempt.state == QuestionState.ACTIVE
+        and remaining_seconds <= attempt.warning_threshold_seconds
+    ):
+        mark_attempt_warning(
+            session,
+            attempt,
+            reason=f"Question {attempt.question_id} entered warning with {remaining_seconds} second(s) remaining.",
+        )
+
+    return attempt
+
+
+def require_active_attempt_for_answer(session: InterviewSession) -> QuestionAttempt:
+    attempt = get_current_attempt(session)
+    if attempt is None:
+        raise HTTPException(status_code=400, detail="No active question exists for this session.")
+
+    sync_attempt_timer(session, attempt)
+    if attempt.state == QuestionState.EXPIRED:
+        raise HTTPException(status_code=409, detail="The current question has expired and is locked.")
+
+    return attempt
+
+
 def apply_guardrails(session: InterviewSession, user_text: str):
     policy = get_interview_policy(session.mode)
     prior_user_texts = collect_prior_user_texts(session)
@@ -293,7 +395,8 @@ def advance_session_engine(session: InterviewSession, *, reason: str) -> tuple[s
     if current_attempt is None:
         raise HTTPException(status_code=400, detail="No active question exists for this session.")
 
-    if current_attempt.state not in {QuestionState.SCORED, QuestionState.SUBMITTED, QuestionState.ADVANCED}:
+    sync_attempt_timer(session, current_attempt)
+    if current_attempt.state not in {QuestionState.SCORED, QuestionState.EXPIRED, QuestionState.ADVANCED}:
         raise HTTPException(status_code=400, detail="Current question must be evaluated before advancing.")
 
     question = get_question_by_attempt(current_attempt)
@@ -430,6 +533,10 @@ class SessionAdvancePayload(BaseModel):
     reason: str = "manual_advance"
 
 
+class SessionTimerEventPayload(BaseModel):
+    event: str = "sync"
+
+
 @app.post("/sessions")
 async def create_session(payload: SessionCreatePayload):
     template_id = payload.template_id or default_template_id_for_mode(payload.mode)
@@ -480,6 +587,7 @@ async def start_session(session_id: str):
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str):
     session = require_session_or_404(session_id)
+    sync_attempt_timer(session, get_current_attempt(session))
     return build_session_payload(session)
 
 
@@ -493,9 +601,12 @@ async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
             **build_session_payload(session),
         }
 
-    attempt = get_current_attempt(session)
-    if attempt is None:
-        return {"error": "No active question exists for this session.", **build_session_payload(session)}
+    try:
+        attempt = require_active_attempt_for_answer(session)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return {"error": exc.detail, **build_session_payload(session)}
+        raise
 
     if attempt.state in {QuestionState.SUBMITTED, QuestionState.SCORED, QuestionState.ADVANCED}:
         return {"error": "The current question has already been answered.", **build_session_payload(session)}
@@ -529,10 +640,48 @@ async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
     }
 
 
+@app.post("/sessions/{session_id}/timer-events")
+async def record_session_timer_event(session_id: str, payload: SessionTimerEventPayload):
+    session = require_session_or_404(session_id)
+    attempt = get_current_attempt(session)
+    if attempt is None:
+        return {"status": "idle", **build_session_payload(session)}
+
+    if payload.event == "warning":
+        sync_attempt_timer(session, attempt, allow_warning_transition=True)
+        if attempt.state == QuestionState.ACTIVE:
+            mark_attempt_warning(session, attempt, reason=f"Client warning event for {attempt.question_id}.")
+        return {
+            "status": "warning" if attempt.state == QuestionState.WARNING else "ok",
+            "ai_text": "You are close to the time limit for this question.",
+            **build_session_payload(session),
+        }
+
+    if payload.event == "expire":
+        mark_attempt_expired(session, attempt, reason=f"Client expiry event for {attempt.question_id}.")
+        return {
+            "status": "expired",
+            "ai_text": "Time is up for this question. Your answer window is now closed.",
+            **build_session_payload(session),
+        }
+
+    sync_attempt_timer(session, attempt)
+    return {
+        "status": "expired" if attempt.state == QuestionState.EXPIRED else "ok",
+        "ai_text": (
+            "Time is up for this question. Your answer window is now closed."
+            if attempt.state == QuestionState.EXPIRED
+            else "Timer synchronized."
+        ),
+        **build_session_payload(session),
+    }
+
+
 @app.post("/sessions/{session_id}/advance")
 async def advance_session(session_id: str, payload: SessionAdvancePayload):
     session = require_session_or_404(session_id)
     current_attempt = get_current_attempt(session)
+    sync_attempt_timer(session, current_attempt)
 
     if session.status not in {SessionStatus.IN_PROGRESS, SessionStatus.REVIEW_PENDING}:
         return {
@@ -542,6 +691,7 @@ async def advance_session(session_id: str, payload: SessionAdvancePayload):
 
     if current_attempt is not None and current_attempt.state not in {
         QuestionState.SCORED,
+        QuestionState.EXPIRED,
         QuestionState.ADVANCED,
     }:
         return {
@@ -589,6 +739,13 @@ async def submit_answer(payload: AnswerPayload):
         ai_text = "I couldn't find an active interview question. Please restart the interview."
         save_response_audio(ai_text)
         return {"status": "error", "ai_text": ai_text}
+
+    sync_attempt_timer(legacy_session, current_attempt)
+    if current_attempt.state == QuestionState.EXPIRED:
+        ai_text, _ = advance_session_engine(legacy_session, reason="legacy_submit_answer_after_expiry")
+        update_legacy_transcript(ai_text=ai_text)
+        save_response_audio(ai_text)
+        return {"status": "expired", "ai_text": ai_text}
 
     guardrail = evaluate_candidate_message(
         user_text,
@@ -662,12 +819,14 @@ def get_audio():
 @app.get("/get-transcript")
 def get_transcript():
     session = get_legacy_session()
+    sync_attempt_timer(session, get_current_attempt(session))
     return {"user_text": session.last_user_text}
 
 
 @app.get("/get-ai-transcript")
 def get_ai_transcript():
     session = get_legacy_session()
+    sync_attempt_timer(session, get_current_attempt(session))
     return {"ai_text": session.last_ai_text}
 
 
@@ -726,6 +885,8 @@ async def process_audio(file: UploadFile = File(...)):
 
         if current_attempt is None:
             ai_text = "I couldn't find an active interview question."
+        elif sync_attempt_timer(legacy_session, current_attempt) and current_attempt.state == QuestionState.EXPIRED:
+            ai_text, _ = advance_session_engine(legacy_session, reason="legacy_process_audio_after_expiry")
         else:
             question = get_question_by_attempt(current_attempt)
             persist_answer_evaluation(legacy_session, current_attempt, question, user_text)

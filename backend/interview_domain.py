@@ -125,6 +125,12 @@ class QuestionAttempt(BaseModel):
     started_at: datetime = Field(default_factory=utc_now)
     submitted_at: Optional[datetime] = None
     time_cap_seconds: Optional[int] = None
+    warning_threshold_seconds: int = 30
+    warning_emitted_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+    locked_at: Optional[datetime] = None
+    lock_reason: str = ""
     scores: List[DimensionScore] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
 
