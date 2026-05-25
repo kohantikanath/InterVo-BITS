@@ -136,6 +136,10 @@ class QuestionAttempt(BaseModel):
 
 
 class FinalScorecard(BaseModel):
+    grading_complete: bool = False
+    recommendation_ready: bool = False
+    attempts_graded: int = 0
+    questions_expected: int = 0
     recommendation: Optional[RecommendationBand] = None
     summary: str = ""
     dimension_scores: List[DimensionScore] = Field(default_factory=list)

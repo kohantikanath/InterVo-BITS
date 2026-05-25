@@ -14,12 +14,16 @@ from gtts import gTTS
 from interview_domain import (
     ALLOWED_QUESTION_STATES,
     ALLOWED_SESSION_STATES,
+    DimensionScore,
+    FinalScorecard,
     InMemoryInterviewStore,
     InterviewMode,
     InterviewSession,
     QuestionAttempt,
     QuestionState,
     Question,
+    RecommendationBand,
+    ScoreEvidence,
     SessionStatus,
     utc_now,
 )
@@ -242,6 +246,120 @@ def count_primary_attempts(session: InterviewSession) -> int:
     return sum(1 for attempt in session.attempts if attempt.source_type == "question")
 
 
+def latest_attempts_by_question(session: InterviewSession) -> list[QuestionAttempt]:
+    latest: dict[str, QuestionAttempt] = {}
+    for attempt in session.attempts:
+        if attempt.question_id:
+            latest[attempt.question_id] = attempt
+    return list(latest.values())
+
+
+def is_attempt_rubric_complete(question: Question, attempt: QuestionAttempt) -> bool:
+    dimension_keys = [dimension.key for dimension in question.rubric.dimensions]
+    score_map = {score.dimension: score for score in attempt.scores}
+    for key in dimension_keys:
+        dimension_score = score_map.get(key)
+        if dimension_score is None or dimension_score.score is None or not dimension_score.evidence:
+            return False
+        if not any(evidence.summary and evidence.transcript_excerpt for evidence in dimension_score.evidence):
+            return False
+    return True
+
+
+def aggregate_dimension_scores(attempts: list[QuestionAttempt]) -> list[DimensionScore]:
+    aggregated: dict[str, list[DimensionScore]] = {}
+    for attempt in attempts:
+        for score in attempt.scores:
+            aggregated.setdefault(score.dimension, []).append(score)
+
+    merged_scores: list[DimensionScore] = []
+    for dimension, dimension_scores in aggregated.items():
+        numeric_scores = [score.score for score in dimension_scores if score.score is not None]
+        average_score = round(sum(numeric_scores) / len(numeric_scores), 2) if numeric_scores else None
+        evidence: list[ScoreEvidence] = []
+        for score in dimension_scores:
+            evidence.extend(score.evidence[:1])
+        merged_scores.append(
+            DimensionScore(
+                dimension=dimension,
+                score=average_score,
+                evidence=evidence[:3],
+            )
+        )
+    return sorted(merged_scores, key=lambda score: score.dimension)
+
+
+def build_recommendation(average_score: float) -> RecommendationBand:
+    if average_score >= 4.2:
+        return RecommendationBand.STRONG_HIRE
+    if average_score >= 3.5:
+        return RecommendationBand.HIRE
+    if average_score >= 2.6:
+        return RecommendationBand.MIXED
+    return RecommendationBand.NO_HIRE
+
+
+def refresh_scorecard(session: InterviewSession) -> FinalScorecard:
+    template = get_template_for_session(session)
+    latest_attempts = latest_attempts_by_question(session)
+    expected_questions = min(template.default_question_count, len(template.question_ids))
+    complete_attempts: list[QuestionAttempt] = []
+    rubric_complete = True
+
+    for attempt in latest_attempts:
+        question = get_question_by_attempt(attempt)
+        if attempt.state == QuestionState.EXPIRED:
+            rubric_complete = False
+            continue
+        if not is_attempt_rubric_complete(question, attempt):
+            rubric_complete = False
+            continue
+        complete_attempts.append(attempt)
+
+    scorecard = FinalScorecard(
+        grading_complete=rubric_complete and len(complete_attempts) == expected_questions,
+        recommendation_ready=(
+            session.status == SessionStatus.COMPLETED
+            and rubric_complete
+            and len(complete_attempts) == expected_questions
+        ),
+        attempts_graded=len(complete_attempts),
+        questions_expected=expected_questions,
+    )
+
+    if complete_attempts:
+        scorecard.dimension_scores = aggregate_dimension_scores(complete_attempts)
+        scorecard.evidence = [evidence for score in scorecard.dimension_scores for evidence in score.evidence[:1]]
+        scorecard.strengths = [
+            score.dimension.replace("_", " ")
+            for score in scorecard.dimension_scores
+            if score.score is not None and score.score >= 4.0
+        ]
+        scorecard.risks = [
+            score.dimension.replace("_", " ")
+            for score in scorecard.dimension_scores
+            if score.score is not None and score.score <= 2.8
+        ]
+
+    if scorecard.recommendation_ready and scorecard.dimension_scores:
+        numeric_scores = [score.score for score in scorecard.dimension_scores if score.score is not None]
+        overall_average = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
+        scorecard.recommendation = build_recommendation(overall_average)
+        scorecard.summary = (
+            f"Rubric grading complete across {len(complete_attempts)} question(s) with an average score of "
+            f"{overall_average:.2f}."
+        )
+        scorecard.generated_at = utc_now()
+    else:
+        scorecard.summary = (
+            f"Grading is not complete yet: {len(complete_attempts)}/{expected_questions} question rubric(s) are fully scored."
+        )
+
+    session.scorecard = scorecard
+    interview_store.upsert_session(session)
+    return scorecard
+
+
 def build_attempt_timer_snapshot(attempt: QuestionAttempt | None) -> dict | None:
     if attempt is None:
         return None
@@ -288,6 +406,7 @@ def mark_attempt_expired(session: InterviewSession, attempt: QuestionAttempt, *,
     session.status = SessionStatus.REVIEW_PENDING
     interview_store.record_event(session.id, "timer_expired", reason)
     interview_store.upsert_session(session)
+    refresh_scorecard(session)
 
 
 def sync_attempt_timer(
@@ -374,6 +493,7 @@ def persist_answer_evaluation(session: InterviewSession, attempt: QuestionAttemp
     attempt.expected_concepts_hit = evaluation.concept_hits
     attempt.missing_concepts = evaluation.missing_concepts
     attempt.selected_follow_up_id = evaluation.selected_follow_up_id
+    attempt.scores = evaluation.dimension_scores
     attempt.notes.extend(evaluation.evidence)
     session.last_user_text = user_text
     session.status = SessionStatus.REVIEW_PENDING
@@ -387,6 +507,7 @@ def persist_answer_evaluation(session: InterviewSession, attempt: QuestionAttemp
         f"{attempt.question_id}: {evaluation.summary}",
     )
     interview_store.upsert_session(session)
+    refresh_scorecard(session)
     return evaluation
 
 
@@ -436,6 +557,7 @@ def advance_session_engine(session: InterviewSession, *, reason: str) -> tuple[s
         session.last_ai_text = "This interview session is complete. A recruiter scorecard can now be generated."
         interview_store.record_event(session.id, "session_completed", reason)
         interview_store.upsert_session(session)
+        refresh_scorecard(session)
         return session.last_ai_text, {"next_step": NextStep.COMPLETE.value}
 
     ai_text = build_interviewer_transition(
@@ -708,10 +830,11 @@ async def advance_session(session_id: str, payload: SessionAdvancePayload):
 @app.get("/sessions/{session_id}/scorecard")
 def get_session_scorecard(session_id: str):
     session = require_session_or_404(session_id)
+    scorecard = refresh_scorecard(session)
     return {
         "session_id": session.id,
         "status": session.status.value,
-        "scorecard": session.scorecard.model_dump(mode="json"),
+        "scorecard": scorecard.model_dump(mode="json"),
     }
 
 
