@@ -45,6 +45,8 @@ load_dotenv()
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini/gemini-2.5-flash")
 DEFAULT_SESSION_TIME_CAP_SECONDS = 300
 DEFAULT_WARNING_THRESHOLD_SECONDS = 30
+SILENCE_TOKENS = {"", "um", "uh", "umm", "hmm", "silence", "no audio", "inaudible"}
+ACTIVE_SUBMISSION_ATTEMPT_IDS: set[str] = set()
 # Set ffmpeg paths required by pydub.
 AudioSegment.converter = shutil.which("ffmpeg")
 AudioSegment.ffmpeg = shutil.which("ffmpeg")
@@ -175,6 +177,35 @@ def build_session_payload(session: InterviewSession) -> dict:
         "allowed_session_states": ALLOWED_SESSION_STATES,
         "allowed_question_states": ALLOWED_QUESTION_STATES,
     }
+
+
+def normalize_candidate_answer(user_text: str | None) -> str:
+    return " ".join((user_text or "").strip().split())
+
+
+def is_empty_or_silence(user_text: str | None) -> bool:
+    normalized = normalize_candidate_answer(user_text)
+    simplified = normalized.lower().strip(" .,!?:;\"'`-_/\\[]{}()")
+    if simplified in SILENCE_TOKENS:
+        return True
+    words = [word.strip(" .,!?:;\"'`-_/\\[]{}()").lower() for word in normalized.split()]
+    words = [word for word in words if word]
+    return bool(words) and all(word in SILENCE_TOKENS for word in words)
+
+
+def safe_save_response_audio(ai_text: str, *, session: InterviewSession | None = None, context: str = "tts") -> bool:
+    try:
+        save_response_audio(ai_text)
+        return True
+    except Exception as exc:
+        print(f"TTS error during {context}: {exc}")
+        if session is not None:
+            interview_store.record_event(
+                session.id,
+                "tts_failed",
+                f"{context}: {exc}",
+            )
+        return False
 
 
 def build_opening_question_prompt() -> str:
@@ -683,6 +714,22 @@ def persist_answer_evaluation(session: InterviewSession, attempt: QuestionAttemp
     return evaluation
 
 
+def reject_empty_session_answer(session: InterviewSession, attempt: QuestionAttempt) -> dict:
+    message = "No usable answer was captured. Please record or enter your answer before submitting."
+    interview_store.record_event(
+        session.id,
+        "empty_answer_rejected",
+        f"{attempt.question_id}: blank or silence-only answer was rejected without scoring.",
+    )
+    interview_store.upsert_session(session)
+    return {
+        "status": "empty_answer",
+        "error": message,
+        "ai_text": message,
+        **build_session_payload(session),
+    }
+
+
 def advance_session_engine(session: InterviewSession, *, reason: str) -> tuple[str, dict]:
     current_attempt = get_current_attempt(session)
     if current_attempt is None:
@@ -801,12 +848,18 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     try:
         user_text = transcribe_wav(wav_filename)
-        update_legacy_transcript(user_text=user_text)
+        if is_empty_or_silence(user_text):
+            print("TRANSCRIBE: No usable speech captured.")
+            return {
+                "status": "empty_transcription",
+                "error": "No usable speech was captured. Please record the answer again.",
+                "user_text": "",
+            }
         print(f"TRANSCRIBE: User said: {user_text}")
-        return {"user_text": user_text}
+        return {"status": "ok", "user_text": user_text}
     except Exception as e:
         print(f"Whisper STT error: {e}")
-        return {"user_text": ""}
+        return {"status": "transcription_failed", "error": str(e), "user_text": ""}
 
 
 class AnswerPayload(BaseModel):
@@ -821,6 +874,7 @@ class SessionCreatePayload(BaseModel):
 
 class SessionAnswerPayload(BaseModel):
     user_text: str
+    attempt_id: str | None = None
 
 
 class SessionAdvancePayload(BaseModel):
@@ -874,7 +928,7 @@ async def start_session(session_id: str):
     )
     interview_store.record_event(session.id, "session_started", "Opening interview question issued.")
     interview_store.upsert_session(session)
-    save_response_audio(opening_prompt)
+    safe_save_response_audio(opening_prompt, session=session, context="session_start")
     return {"status": "ok", "ai_text": opening_prompt, **build_session_payload(session)}
 
 
@@ -888,6 +942,16 @@ def get_session(session_id: str):
 @app.post("/sessions/{session_id}/answers")
 async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
     session = require_session_or_404(session_id)
+    current_attempt = get_current_attempt(session)
+
+    if current_attempt is not None:
+        sync_attempt_timer(session, current_attempt)
+        if current_attempt.state == QuestionState.EXPIRED:
+            return {
+                "status": "expired",
+                "error": "The current question has expired and is locked.",
+                **build_session_payload(session),
+            }
 
     if session.status != SessionStatus.IN_PROGRESS:
         return {
@@ -902,36 +966,75 @@ async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
             return {"error": exc.detail, **build_session_payload(session)}
         raise
 
+    if payload.attempt_id and payload.attempt_id != attempt.id:
+        return {
+            "status": "stale_attempt",
+            "error": "The submitted answer does not match the active question. Refresh the session before retrying.",
+            **build_session_payload(session),
+        }
+
     if attempt.state in {QuestionState.SUBMITTED, QuestionState.SCORED, QuestionState.ADVANCED}:
-        return {"error": "The current question has already been answered.", **build_session_payload(session)}
+        return {
+            "status": "duplicate_answer",
+            "error": "The current question has already been answered.",
+            **build_session_payload(session),
+        }
 
-    user_text = payload.user_text.strip()
+    if attempt.id in ACTIVE_SUBMISSION_ATTEMPT_IDS:
+        return {
+            "status": "duplicate_answer",
+            "error": "This answer is already being processed. Refresh the session in a moment.",
+            **build_session_payload(session),
+        }
+
+    user_text = normalize_candidate_answer(payload.user_text)
+    if is_empty_or_silence(user_text):
+        return reject_empty_session_answer(session, attempt)
+
+    ACTIVE_SUBMISSION_ATTEMPT_IDS.add(attempt.id)
     question = get_question_by_attempt(attempt)
-    guardrail = apply_guardrails(session, user_text)
-    if guardrail is not None:
-        attempt.notes.append(guardrail.note)
-        attempt.user_text = user_text
-        attempt.ai_text = guardrail.response_text
-        session.last_user_text = user_text
-        session.last_ai_text = guardrail.response_text
-        interview_store.record_event(
-            session.id,
-            f"guardrail_{guardrail.category.value}",
-            guardrail.note,
-        )
-        interview_store.upsert_session(session)
-        save_response_audio(guardrail.response_text)
-        return {"status": "guardrail_triggered", "ai_text": guardrail.response_text, **build_session_payload(session)}
+    try:
+        guardrail = apply_guardrails(session, user_text)
+        if guardrail is not None:
+            attempt.notes.append(guardrail.note)
+            attempt.user_text = user_text
+            attempt.ai_text = guardrail.response_text
+            session.last_user_text = user_text
+            session.last_ai_text = guardrail.response_text
+            interview_store.record_event(
+                session.id,
+                f"guardrail_{guardrail.category.value}",
+                guardrail.note,
+            )
+            interview_store.upsert_session(session)
+            safe_save_response_audio(guardrail.response_text, session=session, context="session_guardrail")
+            return {"status": "guardrail_triggered", "ai_text": guardrail.response_text, **build_session_payload(session)}
 
-    evaluation = persist_answer_evaluation(session, attempt, question, user_text)
-    ai_text = session.last_ai_text
-    save_response_audio(ai_text)
-    return {
-        "status": "ok",
-        "ai_text": ai_text,
-        "engine_evaluation": evaluation.to_dict(),
-        **build_session_payload(session),
-    }
+        try:
+            evaluation = persist_answer_evaluation(session, attempt, question, user_text)
+        except Exception as exc:
+            interview_store.record_event(
+                session.id,
+                "answer_evaluation_failed",
+                f"{attempt.question_id}: {exc}",
+            )
+            interview_store.upsert_session(session)
+            return {
+                "status": "evaluation_failed",
+                "error": "The answer could not be evaluated. The current question remains open for retry.",
+                **build_session_payload(session),
+            }
+
+        ai_text = session.last_ai_text
+        safe_save_response_audio(ai_text, session=session, context="session_answer")
+        return {
+            "status": "ok",
+            "ai_text": ai_text,
+            "engine_evaluation": evaluation.to_dict(),
+            **build_session_payload(session),
+        }
+    finally:
+        ACTIVE_SUBMISSION_ATTEMPT_IDS.discard(attempt.id)
 
 
 @app.post("/sessions/{session_id}/timer-events")
@@ -940,6 +1043,13 @@ async def record_session_timer_event(session_id: str, payload: SessionTimerEvent
     attempt = get_current_attempt(session)
     if attempt is None:
         return {"status": "idle", **build_session_payload(session)}
+
+    if payload.event not in {"sync", "warning", "expire"}:
+        return {
+            "status": "invalid_timer_event",
+            "error": "Timer event must be one of: sync, warning, expire.",
+            **build_session_payload(session),
+        }
 
     if payload.event == "warning":
         sync_attempt_timer(session, attempt, allow_warning_transition=True)
@@ -993,8 +1103,22 @@ async def advance_session(session_id: str, payload: SessionAdvancePayload):
             **build_session_payload(session),
         }
 
-    ai_text, engine_decision = advance_session_engine(session, reason=payload.reason)
-    save_response_audio(ai_text)
+    try:
+        ai_text, engine_decision = advance_session_engine(session, reason=payload.reason)
+    except Exception as exc:
+        interview_store.record_event(
+            session.id,
+            "advance_failed",
+            f"{current_attempt.question_id if current_attempt else 'no_attempt'}: {exc}",
+        )
+        interview_store.upsert_session(session)
+        return {
+            "status": "advance_failed",
+            "error": "The session could not advance. Refresh and retry.",
+            **build_session_payload(session),
+        }
+
+    safe_save_response_audio(ai_text, session=session, context="session_advance")
     status = "completed" if engine_decision["next_step"] == NextStep.COMPLETE.value else "ok"
     return {"status": status, "ai_text": ai_text, "engine_decision": engine_decision, **build_session_payload(session)}
 

@@ -17,6 +17,15 @@ import {
   Square,
   User,
 } from "lucide-react";
+import {
+  buildTranscript,
+  formatState,
+  formatTime,
+  isQuestionLocked,
+  isTimerWarning,
+  type QuestionState,
+  type TranscriptMessage,
+} from "@/lib/interviewUi";
 
 const SERVER_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -31,14 +40,7 @@ type Phase =
   | "advancing"
   | "completed";
 
-type QuestionState = "ready" | "active" | "warning" | "expired" | "submitted" | "scored" | "advanced";
 type SessionStatus = "draft" | "ready" | "in_progress" | "review_pending" | "completed" | "aborted";
-
-interface Message {
-  role: "ai" | "user" | "system";
-  text: string;
-  attemptId?: string;
-}
 
 interface QuestionAttempt {
   id: string;
@@ -101,22 +103,6 @@ const phaseLabels: Record<Phase, string> = {
   completed: "Completed",
 };
 
-const lockedQuestionStates: QuestionState[] = ["expired", "scored", "advanced"];
-
-function formatTime(seconds: number | null | undefined) {
-  if (seconds === null || seconds === undefined) return "--:--";
-  const safeSeconds = Math.max(0, seconds);
-  const mins = Math.floor(safeSeconds / 60)
-    .toString()
-    .padStart(2, "0");
-  const secs = (safeSeconds % 60).toString().padStart(2, "0");
-  return `${mins}:${secs}`;
-}
-
-function formatState(value: string) {
-  return value.replace(/_/g, " ");
-}
-
 function getServerUrl() {
   if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
   if (typeof window === "undefined") return SERVER_URL;
@@ -127,45 +113,12 @@ function getServerUrl() {
   return `http://${hostname}:8000`;
 }
 
-function buildTranscript(session: InterviewSession): Message[] {
-  const messages: Message[] = [];
-
-  session.attempts.forEach((attempt) => {
-    const prompt = attempt.prompt_text || attempt.ai_text;
-    if (prompt) {
-      messages.push({
-        role: "ai",
-        text: prompt,
-        attemptId: attempt.id,
-      });
-    }
-
-    if (attempt.user_text) {
-      messages.push({
-        role: "user",
-        text: attempt.user_text,
-        attemptId: attempt.id,
-      });
-    }
-
-    if (attempt.state === "expired" && !attempt.user_text) {
-      messages.push({
-        role: "system",
-        text: "Time expired before an answer was submitted.",
-        attemptId: attempt.id,
-      });
-    }
-  });
-
-  return messages;
-}
-
 export default function InterviewClient() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [session, setSession] = useState<InterviewSession | null>(null);
   const [currentAttempt, setCurrentAttempt] = useState<QuestionAttempt | null>(null);
   const [timer, setTimer] = useState<TimerSnapshot | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<TranscriptMessage[]>([]);
   const [draftAnswer, setDraftAnswer] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -182,15 +135,9 @@ export default function InterviewClient() {
   const isBusy = ["starting", "submitting", "transcribing", "advancing"].includes(phase);
   const sessionStarted = Boolean(session);
   const isCompleted = session?.status === "completed" || phase === "completed";
-  const attemptLocked = Boolean(timer?.locked || (currentAttempt && lockedQuestionStates.includes(currentAttempt.state)));
+  const attemptLocked = isQuestionLocked(currentAttempt?.state, timer?.locked);
   const isExpired = Boolean(timer?.expired || currentAttempt?.state === "expired");
-  const showWarning = Boolean(
-    timer &&
-      localRemainingSeconds !== null &&
-      localRemainingSeconds > 0 &&
-      localRemainingSeconds <= timer.warning_threshold_seconds &&
-      !attemptLocked
-  );
+  const showWarning = isTimerWarning(timer, localRemainingSeconds, attemptLocked);
 
   const primaryAttempts = session?.attempts.filter((attempt) => attempt.source_type === "question") ?? [];
   const answeredAttempts = primaryAttempts.filter((attempt) =>
@@ -217,7 +164,7 @@ export default function InterviewClient() {
     setSession(payload.session);
     setCurrentAttempt(payload.current_attempt);
     setTimer(payload.timer);
-    setMessages(buildTranscript(payload.session));
+    setMessages(buildTranscript(payload.session.attempts));
     setLocalRemainingSeconds(payload.timer?.remaining_seconds ?? null);
 
     if (payload.session.status === "completed") {
@@ -438,6 +385,13 @@ export default function InterviewClient() {
       if (!response.ok) throw new Error(`Server returned ${response.status}`);
 
       const data = await response.json();
+      if (data.status !== "ok" || data.error) {
+        setError(data.error || "No usable speech was captured. Please record again.");
+        setDraftAnswer("");
+        setPhase("ready");
+        return;
+      }
+
       setDraftAnswer(data.user_text || "");
       setPhase("pending_submit");
     } catch (err) {
@@ -457,7 +411,7 @@ export default function InterviewClient() {
     try {
       const payload = await requestJson(`/sessions/${session.id}/answers`, {
         method: "POST",
-        body: JSON.stringify({ user_text: text }),
+        body: JSON.stringify({ user_text: text, attempt_id: currentAttempt?.id ?? null }),
       });
 
       if (payload.error) {
