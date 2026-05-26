@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'InterVo - Mathematics Admission Interview',
-  description: 'AI-powered professional mathematics interviewer for SST admissions.',
+  title: 'InterVo - Hiring-Grade DSA Interview',
+  description: 'Structured AI interview sessions and recruiter scorecards for DSA hiring.',
 };
 
 export default function RootLayout({
