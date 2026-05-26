@@ -389,6 +389,46 @@ def build_review_acknowledgement(evaluation: AnswerEvaluation) -> str:
     return "Answer evaluated. This interview segment is ready to conclude."
 
 
+def build_practice_feedback(question: Question, evaluation: AnswerEvaluation) -> dict:
+    concept_hits = evaluation.concept_hits[:]
+    missing_concepts = evaluation.missing_concepts[:]
+    next_hint = (
+        f"Revisit {missing_concepts[0]} and explain how it affects correctness or complexity."
+        if missing_concepts
+        else "Try tightening the proof of correctness and naming the key invariant."
+    )
+    rubric_signals = [
+        {
+            "dimension": score.dimension,
+            "score": score.score,
+            "summary": score.evidence[0].summary if score.evidence else "",
+        }
+        for score in evaluation.dimension_scores
+    ]
+
+    return {
+        "mode": InterviewMode.PRACTICE.value,
+        "question_id": question.id,
+        "quality": evaluation.quality.value,
+        "clarity": evaluation.clarity.value,
+        "summary": evaluation.summary,
+        "coaching": (
+            "Practice review: compare your answer against the expected concepts, then revise the explanation "
+            "to make the algorithm, correctness argument, complexity, and edge cases explicit."
+        ),
+        "concepts_hit": concept_hits,
+        "missing_concepts": missing_concepts,
+        "hint": next_hint,
+        "solution_outline": [
+            "State the core approach and the data structure or recurrence you would use.",
+            "Name the invariant or transition that makes the approach correct.",
+            "Give time and space complexity, including trade-offs.",
+            "Call out edge cases before moving on.",
+        ],
+        "rubric_signals": rubric_signals,
+    }
+
+
 def build_interviewer_transition(
     *,
     next_step: NextStep,
