@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Send,
   ShieldCheck,
+  Sparkles,
   Square,
   User,
 } from "lucide-react";
@@ -41,6 +42,7 @@ type Phase =
   | "completed";
 
 type SessionStatus = "draft" | "ready" | "in_progress" | "review_pending" | "completed" | "aborted";
+type InterviewMode = "hiring" | "practice";
 
 interface QuestionAttempt {
   id: string;
@@ -89,6 +91,24 @@ interface SessionPayload {
   ai_text?: string;
   status?: string;
   error?: string;
+  practice_feedback?: PracticeFeedback;
+}
+
+interface PracticeFeedback {
+  mode: "practice";
+  quality: string;
+  clarity: string;
+  summary: string;
+  coaching: string;
+  concepts_hit: string[];
+  missing_concepts: string[];
+  hint: string;
+  solution_outline: string[];
+  rubric_signals: Array<{
+    dimension: string;
+    score: number | null;
+    summary: string;
+  }>;
 }
 
 const phaseLabels: Record<Phase, string> = {
@@ -122,6 +142,8 @@ export default function InterviewClient() {
   const [draftAnswer, setDraftAnswer] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [selectedMode, setSelectedMode] = useState<InterviewMode>("hiring");
+  const [practiceFeedback, setPracticeFeedback] = useState<PracticeFeedback | null>(null);
   const [localRemainingSeconds, setLocalRemainingSeconds] = useState<number | null>(null);
   const [warningSentForAttemptId, setWarningSentForAttemptId] = useState<string | null>(null);
   const [expirySentForAttemptId, setExpirySentForAttemptId] = useState<string | null>(null);
@@ -146,19 +168,21 @@ export default function InterviewClient() {
   const expectedQuestions = 6;
   const progress = Math.min(100, Math.round((answeredAttempts.length / expectedQuestions) * 100));
   const statusLabel = isExpired ? "Expired" : showWarning ? "Time warning" : phaseLabels[phase];
+  const activeMode = session?.mode || selectedMode;
+  const isPracticeMode = activeMode === "practice";
 
   const currentGuidance = useMemo(() => {
-    if (!sessionStarted) return "Begin a hiring-grade DSA interview session.";
-    if (isCompleted) return "Interview complete. The recruiter scorecard can be reviewed separately.";
+    if (!sessionStarted) return isPracticeMode ? "Begin a coaching-friendly DSA practice session." : "Begin a hiring-grade DSA interview session.";
+    if (isCompleted) return isPracticeMode ? "Practice session complete. Review the coaching notes before trying another round." : "Interview complete. The recruiter scorecard can be reviewed separately.";
     if (isExpired) return "The answer window is locked. Advance to continue.";
     if (showWarning) return "Wrap up your reasoning. The hard time cap is approaching.";
     if (phase === "recording") return "Answer with assumptions, algorithm, complexity, and edge cases.";
-    if (phase === "pending_submit") return "Review the transcript. No hints or correctness checks are shown in hiring mode.";
+    if (phase === "pending_submit") return isPracticeMode ? "Review the transcript before receiving coaching." : "Review the transcript. No hints or correctness checks are shown in hiring mode.";
     if (phase === "transcribing") return "Converting your voice into editable transcript text.";
     if (phase === "submitting") return "Evaluating this attempt against the hiring rubric.";
     if (phase === "advancing") return "Loading the next interview step.";
     return "Record your answer when ready.";
-  }, [isCompleted, isExpired, phase, sessionStarted, showWarning]);
+  }, [isCompleted, isExpired, isPracticeMode, phase, sessionStarted, showWarning]);
 
   const applySessionPayload = useCallback((payload: SessionPayload, fallbackPhase?: Phase) => {
     setSession(payload.session);
@@ -166,6 +190,9 @@ export default function InterviewClient() {
     setTimer(payload.timer);
     setMessages(buildTranscript(payload.session.attempts));
     setLocalRemainingSeconds(payload.timer?.remaining_seconds ?? null);
+    if (payload.practice_feedback) {
+      setPracticeFeedback(payload.practice_feedback);
+    }
 
     if (payload.session.status === "completed") {
       setPhase("completed");
@@ -216,11 +243,12 @@ export default function InterviewClient() {
     setNotice("");
     setPhase("starting");
     setDraftAnswer("");
+    setPracticeFeedback(null);
 
     try {
       const created = await requestJson("/sessions", {
         method: "POST",
-        body: JSON.stringify({ mode: "hiring" }),
+        body: JSON.stringify({ mode: selectedMode }),
       });
       const started = await requestJson(`/sessions/${created.session.id}/start`, { method: "POST" });
       applySessionPayload(started, "ready");
@@ -320,6 +348,7 @@ export default function InterviewClient() {
     if (attemptLocked || isCompleted) return;
     setError("");
     setNotice("");
+    setPracticeFeedback(null);
 
     try {
       if (!window.isSecureContext) {
@@ -444,6 +473,7 @@ export default function InterviewClient() {
       }
 
       setDraftAnswer("");
+      setPracticeFeedback(null);
       setWarningSentForAttemptId(null);
       setExpirySentForAttemptId(null);
       applySessionPayload(payload);
@@ -563,10 +593,28 @@ export default function InterviewClient() {
 
           <div className="control-strip">
             {!sessionStarted ? (
-              <button className="primary-action" onClick={beginInterview} disabled={phase === "starting"}>
-                {phase === "starting" ? <RefreshCw className="spin" size={18} /> : <Play size={18} />}
-                {phase === "starting" ? "Starting" : "Begin interview"}
-              </button>
+              <>
+                <div className="mode-toggle" aria-label="Interview mode">
+                  <button
+                    className={selectedMode === "hiring" ? "active" : ""}
+                    onClick={() => setSelectedMode("hiring")}
+                    type="button"
+                  >
+                    Hiring
+                  </button>
+                  <button
+                    className={selectedMode === "practice" ? "active" : ""}
+                    onClick={() => setSelectedMode("practice")}
+                    type="button"
+                  >
+                    Practice
+                  </button>
+                </div>
+                <button className="primary-action" onClick={beginInterview} disabled={phase === "starting"}>
+                  {phase === "starting" ? <RefreshCw className="spin" size={18} /> : <Play size={18} />}
+                  {phase === "starting" ? "Starting" : `Begin ${selectedMode}`}
+                </button>
+              </>
             ) : isCompleted ? (
               <button className="secondary-action" onClick={refreshSession}>
                 <RefreshCw size={16} />
@@ -615,15 +663,51 @@ export default function InterviewClient() {
           <section className="focus-panel">
             <div className="panel-heading">
               <ShieldCheck size={16} />
-              Hiring mode
+              {isPracticeMode ? "Practice mode" : "Hiring mode"}
             </div>
             <div className="policy-list">
-              <span>No hints</span>
-              <span>No solution coaching</span>
-              <span>No grading disclosure</span>
-              <span>Timer enforced</span>
+              {isPracticeMode ? (
+                <>
+                  <span>Post-answer hints</span>
+                  <span>Coaching notes</span>
+                  <span>Rubric signals</span>
+                  <span>Timer enforced</span>
+                </>
+              ) : (
+                <>
+                  <span>No hints</span>
+                  <span>No solution coaching</span>
+                  <span>No grading disclosure</span>
+                  <span>Timer enforced</span>
+                </>
+              )}
             </div>
           </section>
+
+          {practiceFeedback && (
+            <section className="practice-panel">
+              <div className="panel-heading">
+                <Sparkles size={16} />
+                Practice coaching
+              </div>
+              <p>{practiceFeedback.coaching}</p>
+              <div className="practice-feedback-grid">
+                <div>
+                  <strong>Hint</strong>
+                  <span>{practiceFeedback.hint}</span>
+                </div>
+                <div>
+                  <strong>Quality</strong>
+                  <span>{formatState(practiceFeedback.quality)} · {formatState(practiceFeedback.clarity)}</span>
+                </div>
+              </div>
+              <div className="practice-list">
+                {practiceFeedback.solution_outline.map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+              </div>
+            </section>
+          )}
 
           <section className="transcript-panel">
             <div className="panel-heading transcript-heading">

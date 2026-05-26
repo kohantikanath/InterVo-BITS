@@ -539,6 +539,31 @@ h1 {
   background: var(--panel-soft);
 }
 
+.mode-toggle {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.mode-toggle button {
+  min-height: 38px;
+  padding: 0 12px;
+  border-radius: 6px;
+  color: var(--muted-strong);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.mode-toggle button.active {
+  color: #ffffff;
+  background: var(--primary);
+}
+
 .control-strip p,
 .review-reminder {
   color: var(--muted-strong);
@@ -641,14 +666,74 @@ h1 {
 }
 
 .focus-panel,
+.practice-panel,
 .transcript-panel {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #ffffff;
 }
 
-.focus-panel {
+.focus-panel,
+.practice-panel {
   padding: 14px;
+}
+
+.practice-panel {
+  display: grid;
+  gap: 12px;
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.practice-panel p {
+  color: #1e3a8a;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.practice-feedback-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.practice-feedback-grid div {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.practice-feedback-grid strong {
+  color: var(--primary-strong);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.practice-feedback-grid span {
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.practice-list {
+  display: grid;
+  gap: 7px;
+}
+
+.practice-list span {
+  padding: 9px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  color: var(--muted-strong);
+  background: #ffffff;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.45;
 }
 
 .panel-heading {
@@ -1363,6 +1448,10 @@ h1 {
   .control-strip {
     flex-direction: column;
     text-align: center;
+  }
+
+  .practice-feedback-grid {
+    grid-template-columns: 1fr;
   }
 
   .draft-actions {

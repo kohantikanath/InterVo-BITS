@@ -25,7 +25,10 @@ class SessionApiTestCase(unittest.TestCase):
         self.audio_patch.stop()
 
     def create_started_session(self):
-        create_response = self.client.post("/sessions", json={"mode": "hiring"})
+        return self.create_started_session_for_mode("hiring")
+
+    def create_started_session_for_mode(self, mode: str):
+        create_response = self.client.post("/sessions", json={"mode": mode})
         self.assertEqual(create_response.status_code, 200)
         session_id = create_response.json()["session"]["id"]
 
@@ -145,6 +148,35 @@ class SessionApiTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(data["session_events"]), 2)
         self.assertFalse(data["scorecard"]["recommendation_ready"])
         self.assertTrue(data["scorecard"]["recommendation_blocked_reason"])
+
+    def test_practice_mode_returns_coaching_after_evaluation(self):
+        session_id, started = self.create_started_session_for_mode("practice")
+
+        response = self.client.post(
+            f"/sessions/{session_id}/answers",
+            json={"user_text": STRONG_ANSWER, "attempt_id": started["current_attempt"]["id"]},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        self.assertEqual(data["session"]["mode"], InterviewMode.PRACTICE.value)
+        self.assertIn("practice_feedback", data)
+        self.assertEqual(data["practice_feedback"]["mode"], InterviewMode.PRACTICE.value)
+        self.assertIn("solution_outline", data["practice_feedback"])
+        self.assertIn("rubric_signals", data["practice_feedback"])
+
+    def test_hiring_mode_does_not_return_practice_feedback(self):
+        session_id, started = self.create_started_session()
+
+        response = self.client.post(
+            f"/sessions/{session_id}/answers",
+            json={"user_text": STRONG_ANSWER, "attempt_id": started["current_attempt"]["id"]},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        self.assertEqual(data["session"]["mode"], InterviewMode.HIRING.value)
+        self.assertNotIn("practice_feedback", data)
 
 
 if __name__ == "__main__":

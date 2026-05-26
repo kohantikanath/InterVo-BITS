@@ -31,6 +31,7 @@ from interview_domain import (
 from interview_engine import (
     NextStep,
     build_interviewer_transition,
+    build_practice_feedback,
     build_review_acknowledgement,
     evaluate_answer,
 )
@@ -1026,13 +1027,21 @@ async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
             }
 
         ai_text = session.last_ai_text
+        practice_feedback = (
+            build_practice_feedback(question, evaluation)
+            if session.mode == InterviewMode.PRACTICE
+            else None
+        )
         safe_save_response_audio(ai_text, session=session, context="session_answer")
-        return {
+        response_payload = {
             "status": "ok",
             "ai_text": ai_text,
             "engine_evaluation": evaluation.to_dict(),
             **build_session_payload(session),
         }
+        if practice_feedback is not None:
+            response_payload["practice_feedback"] = practice_feedback
+        return response_payload
     finally:
         ACTIVE_SUBMISSION_ATTEMPT_IDS.discard(attempt.id)
 
