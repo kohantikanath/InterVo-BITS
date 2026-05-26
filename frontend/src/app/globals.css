@@ -17,6 +17,7 @@
   --danger: #dc2626;
   --danger-soft: #fee2e2;
   --warning: #b45309;
+  --warning-soft: #fef3c7;
   --shadow: 0 18px 55px rgba(15, 23, 42, 0.11);
 }
 
@@ -84,6 +85,7 @@ button:not(:disabled) {
 
 .app-header,
 .error-banner,
+.notice-banner,
 .stage-panel,
 .insight-panel {
   border: 1px solid var(--border);
@@ -159,8 +161,10 @@ h1 {
 }
 
 .live-status-ai_speaking,
+.live-status-starting,
 .live-status-submitting,
-.live-status-transcribing {
+.live-status-transcribing,
+.live-status-advancing {
   color: var(--primary);
   background: var(--primary-soft);
   border-color: #bfdbfe;
@@ -173,15 +177,40 @@ h1 {
 }
 
 .live-status-ready,
-.live-status-pending_submit {
+.live-status-pending_submit,
+.live-status-completed {
   color: var(--success);
   background: var(--success-soft);
   border-color: #bbf7d0;
 }
 
+.live-status-warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: #fde68a;
+}
+
+.live-status-expired {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: #fecaca;
+}
+
 .session-time {
   justify-self: end;
   min-width: 104px;
+}
+
+.session-time-warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: #fde68a;
+}
+
+.session-time-expired {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: #fecaca;
 }
 
 .error-banner {
@@ -193,6 +222,19 @@ h1 {
   color: #991b1b;
   background: #fff7f7;
   border-color: #fecaca;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.notice-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  color: #065f46;
+  background: #f0fdf4;
+  border-color: #bbf7d0;
   font-size: 14px;
   font-weight: 600;
 }
@@ -216,6 +258,10 @@ h1 {
   flex-direction: column;
   padding: 20px;
   gap: 18px;
+}
+
+.stage-expired {
+  border-color: #fecaca;
 }
 
 .stage-header {
@@ -262,6 +308,74 @@ h1 {
   border-radius: inherit;
   background: linear-gradient(90deg, var(--primary), var(--success));
   transition: width 0.3s ease;
+}
+
+.question-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 16px;
+}
+
+.question-panel-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.question-panel h3 {
+  margin-top: 6px;
+  color: var(--foreground);
+  font-size: 19px;
+  line-height: 1.45;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.attempt-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-strong);
+  background: var(--panel-soft);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.attempt-state-warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: #fde68a;
+}
+
+.attempt-state-expired {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: #fecaca;
+}
+
+.attempt-state-scored,
+.attempt-state-advanced {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: #bbf7d0;
+}
+
+.time-cap-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted-strong);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .participant-grid {
@@ -547,7 +661,8 @@ h1 {
   margin-top: 12px;
 }
 
-.focus-list span {
+.focus-list span,
+.policy-list span {
   padding: 7px 10px;
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -555,6 +670,13 @@ h1 {
   color: var(--muted-strong);
   font-size: 12px;
   font-weight: 700;
+}
+
+.policy-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 .transcript-panel {
@@ -624,6 +746,11 @@ h1 {
   background: #eff6ff;
 }
 
+.message-card.system {
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+
 .message-card p,
 .draft-card label {
   margin-bottom: 7px;
@@ -662,6 +789,16 @@ h1 {
 .draft-card textarea:focus {
   border-color: var(--success);
   box-shadow: 0 0 0 3px rgba(15, 159, 110, 0.14);
+}
+
+.draft-card textarea:disabled {
+  color: var(--muted);
+  background: #f1f5f9;
+}
+
+.draft-locked {
+  border-color: #fecaca;
+  background: #fff7f7;
 }
 
 .draft-actions {
@@ -719,6 +856,10 @@ h1 {
   }
 
   .stage-header {
+    flex-direction: column;
+  }
+
+  .question-panel-heading {
     flex-direction: column;
   }
 
