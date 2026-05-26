@@ -1,5 +1,20 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Backend Checks
+
+Run the backend automated checks from the `backend` folder:
+
+```bash
+.\.venv\Scripts\python.exe run_tests.py
+```
+
+Run the internal calibration report for question quality and scoring spread:
+
+```bash
+.\.venv\Scripts\python.exe calibration.py
+.\.venv\Scripts\python.exe calibration.py --format json
+```
+
 ## Getting Started
 
 First, run the development server:
