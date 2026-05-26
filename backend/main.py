@@ -942,6 +942,16 @@ def get_session(session_id: str):
 @app.post("/sessions/{session_id}/answers")
 async def submit_session_answer(session_id: str, payload: SessionAnswerPayload):
     session = require_session_or_404(session_id)
+    current_attempt = get_current_attempt(session)
+
+    if current_attempt is not None:
+        sync_attempt_timer(session, current_attempt)
+        if current_attempt.state == QuestionState.EXPIRED:
+            return {
+                "status": "expired",
+                "error": "The current question has expired and is locked.",
+                **build_session_payload(session),
+            }
 
     if session.status != SessionStatus.IN_PROGRESS:
         return {
