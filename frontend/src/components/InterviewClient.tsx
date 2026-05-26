@@ -438,6 +438,13 @@ export default function InterviewClient() {
       if (!response.ok) throw new Error(`Server returned ${response.status}`);
 
       const data = await response.json();
+      if (data.status !== "ok" || data.error) {
+        setError(data.error || "No usable speech was captured. Please record again.");
+        setDraftAnswer("");
+        setPhase("ready");
+        return;
+      }
+
       setDraftAnswer(data.user_text || "");
       setPhase("pending_submit");
     } catch (err) {
@@ -457,7 +464,7 @@ export default function InterviewClient() {
     try {
       const payload = await requestJson(`/sessions/${session.id}/answers`, {
         method: "POST",
-        body: JSON.stringify({ user_text: text }),
+        body: JSON.stringify({ user_text: text, attempt_id: currentAttempt?.id ?? null }),
       });
 
       if (payload.error) {
